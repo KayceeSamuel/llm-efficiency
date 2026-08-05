@@ -1,0 +1,11 @@
+cat > .gitignore << 'EOF'
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+results/*.json
+results/ledger.jsonl
+*.safetensors
+*.bin
+.env
+.DS_Store
+EOF
