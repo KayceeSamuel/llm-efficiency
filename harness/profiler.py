@@ -48,6 +48,104 @@ def _reserved_gb() -> float:
     return round(torch.cuda.memory_reserved() / 1024**3, 3)
 
 
+def measure_cache(cache, n_tokens: int) -> Dict[str, Any]:
+    """
+    Measure cache memory directly off the cache object.
+
+    Written against the transformers v5 Cache API, where `cache.layers` is a
+    list of per-layer objects and `to_legacy_cache()` no longer exists. On a
+    hybrid model the list is heterogeneous:
+
+      DynamicLayer         -> full attention. Has .keys / .values, both
+                              growing with sequence length.
+      LinearAttentionLayer -> Gated DeltaNet. Has .recurrent_states and
+                              .conv_states, both FIXED SIZE regardless of
+                              context length.
+
+    Those two are reported separately, because conflating them is precisely
+    the mistake the hybrid architecture invites: the KV total scales with
+    context and the GDN state does not, so a single combined number would
+    hide the structural difference the research question depends on.
+
+    Raises rather than returning zeros on an unrecognised cache type. The
+    previous version swallowed the exception and reported 0.0 GB, which is a
+    plausible-looking wrong answer -- the worst possible failure mode in a
+    measurement harness.
+    """
+    if cache is None:
+        raise ValueError("No cache returned; was use_cache=True set?")
+
+    layers = getattr(cache, "layers", None)
+    if layers is None:
+        # Pre-v5 tuple-of-tuples fallback.
+        if isinstance(cache, (list, tuple)):
+            layers = cache
+        else:
+            raise TypeError(
+                f"Unrecognised cache type {type(cache).__name__}: no .layers "
+                f"attribute and not a sequence. Cache extraction must be "
+                f"updated for this transformers version."
+            )
+
+    kv_bytes = 0            # attention layers: scales with context
+    recurrent_bytes = 0     # GDN layers: fixed size
+    conv_bytes = 0          # GDN layers: fixed size
+    n_attn_layers = 0
+    n_linear_layers = 0
+    layer_types: Dict[str, int] = {}
+
+    def _nbytes(t) -> int:
+        return t.numel() * t.element_size() if torch.is_tensor(t) else 0
+
+    for layer in layers:
+        if layer is None:
+            continue
+
+        tname = type(layer).__name__
+        layer_types[tname] = layer_types.get(tname, 0) + 1
+
+        keys = getattr(layer, "keys", None)
+        values = getattr(layer, "values", None)
+        rec = getattr(layer, "recurrent_states", None)
+        conv = getattr(layer, "conv_states", None)
+
+        if keys is not None or values is not None:
+            b = _nbytes(keys) + _nbytes(values)
+            if b > 0:
+                kv_bytes += b
+                n_attn_layers += 1
+        elif rec is not None or conv is not None:
+            rb, cb = _nbytes(rec), _nbytes(conv)
+            if rb + cb > 0:
+                recurrent_bytes += rb
+                conv_bytes += cb
+                n_linear_layers += 1
+        elif isinstance(layer, (list, tuple)):
+            b = sum(_nbytes(t) for t in layer)
+            if b > 0:
+                kv_bytes += b
+                n_attn_layers += 1
+
+    state_bytes = recurrent_bytes + conv_bytes
+
+    return {
+        # Attention layers -- grows linearly with context.
+        "kv_cache_gb": round(kv_bytes / 1024**3, 5),
+        "kv_bytes_per_token": int(kv_bytes / n_tokens) if n_tokens else None,
+        "kv_layers": n_attn_layers,
+
+        # GDN layers -- constant in context length. Answers the design doc's
+        # open item on GDN state size, which is not publicly specified.
+        "gdn_state_gb": round(state_bytes / 1024**3, 5),
+        "gdn_recurrent_gb": round(recurrent_bytes / 1024**3, 5),
+        "gdn_conv_gb": round(conv_bytes / 1024**3, 5),
+        "gdn_layers": n_linear_layers,
+
+        "total_cache_gb": round((kv_bytes + state_bytes) / 1024**3, 5),
+        "layer_types": layer_types,
+    }
+
+
 def make_synthetic_prompt(tok, target_tokens: int) -> str:
     """
     Build a prompt of approximately target_tokens. Used for memory scaling
@@ -89,40 +187,20 @@ def measure_prefill(model, tok, prompt: str) -> Dict[str, Any]:
 
     peak = _peak_gb()
 
-    # KV-cache size measured directly from the returned cache, rather than
-    # inferred from architecture specs. Handles GQA/MQA and hybrid layouts
-    # (where only some layers cache) without assuming a formula.
-    kv_bytes = 0
-    n_cached_layers = 0
-    try:
-        cache = out.past_key_values
-        layers = cache.to_legacy_cache() if hasattr(cache, "to_legacy_cache") else cache
-        for layer in layers:
-            if layer is None:
-                continue
-            counted = False
-            for t in layer:
-                if torch.is_tensor(t) and t.numel() > 0:
-                    kv_bytes += t.numel() * t.element_size()
-                    counted = True
-            if counted:
-                n_cached_layers += 1
-    except Exception:
-        pass
+    cache_stats = measure_cache(out.past_key_values, n_tokens)
 
     del out
     torch.cuda.empty_cache()
 
-    return {
+    result = {
         "prompt_tokens": n_tokens,
         "prefill_seconds": round(elapsed, 4),
         "prefill_tokens_per_sec": round(n_tokens / elapsed, 1) if elapsed > 0 else None,
         "peak_gb": peak,
         "peak_above_weights_gb": round(peak - baseline, 3),
-        "kv_cache_gb": round(kv_bytes / 1024**3, 4),
-        "kv_bytes_per_token": int(kv_bytes / n_tokens) if n_tokens else None,
-        "layers_with_cache": n_cached_layers,
     }
+    result.update(cache_stats)
+    return result
 
 
 def measure_generation(

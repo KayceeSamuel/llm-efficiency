@@ -80,7 +80,12 @@ def context_curve(record: Dict[str, Any]) -> List[Dict[str, Any]]:
             "context": point.get("prompt_tokens"),
             "kv_cache_gb": point.get("kv_cache_gb"),
             "kv_bytes_per_token": point.get("kv_bytes_per_token"),
-            "layers_with_cache": point.get("layers_with_cache"),
+            "kv_layers": point.get("kv_layers"),
+            # Constant in context length -- the hybrid architecture's
+            # structural advantage, and the figure the design doc lists as
+            # publicly unspecified.
+            "gdn_state_gb": point.get("gdn_state_gb"),
+            "gdn_layers": point.get("gdn_layers"),
             "prefill_peak_above_weights_gb": point.get("peak_above_weights_gb"),
             "prefill_tok_per_sec": point.get("prefill_tokens_per_sec"),
             "gen_peak_gb": gen.get("peak_gb"),
