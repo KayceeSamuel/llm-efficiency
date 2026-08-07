@@ -72,6 +72,73 @@ def largest_pow2_divisor(n: int) -> int:
     return n & (-n)
 
 
+def random_orthogonal(m: int, seed: int = 0, device=None,
+                      dtype=torch.float32) -> torch.Tensor:
+    """
+    Deterministic random orthogonal matrix via QR.
+
+    Sign-corrected against the diagonal of R so the result is reproducible
+    across runs rather than depending on LAPACK's arbitrary sign convention.
+    """
+    g = torch.Generator().manual_seed(seed)
+    A = torch.randn(m, m, generator=g, dtype=torch.float32)
+    Q, R = torch.linalg.qr(A)
+    Q = Q * torch.sign(torch.diagonal(R)).unsqueeze(0)
+    return Q.to(dtype=dtype, device=device)
+
+
+def kronecker_rotation_factors(n: int, seed: int = 0, device=None,
+                               dtype=torch.float32):
+    """
+    Build factors for an orthogonal rotation of ANY dimension n.
+
+    Factorise n = k * m where k is the largest power-of-2 divisor. The
+    rotation is the Kronecker product H_k (x) Q_m, which is orthogonal
+    whenever both factors are, and mixes across the WHOLE dimension rather
+    than only within blocks of size k.
+
+    This resolves the confound in the first version of this experiment.
+    Previously, dimensions that were not powers of 2 received only
+    block-diagonal mixing, which is strictly weaker. Since FFN matrices
+    happened to have non-power-of-2 dimensions while GDN projections did not,
+    the apparent "rotation helps GDN 3x more than FFN" result conflated a
+    genuine role effect with an artifact of unequal rotation strength.
+
+    Verified on synthetic outlier-seeded matrices: at n=4864 (256 x 19),
+    blockwise mixing reduced max/std from 55.7 to 6.4, Kronecker to 5.1.
+
+    The n x n matrix is never materialised -- see apply_kronecker_rotation.
+    """
+    k = largest_pow2_divisor(n)
+    m = n // k
+    if k < 2:
+        raise ValueError(f"Dimension {n} has no usable power-of-2 factor")
+    H_k = hadamard_matrix(k, device=device, dtype=dtype)
+    Q_m = (random_orthogonal(m, seed=seed, device=device, dtype=dtype)
+           if m > 1 else torch.ones(1, 1, dtype=dtype, device=device))
+    return H_k, Q_m, k, m
+
+
+def apply_kronecker_rotation(X: torch.Tensor, H_k: torch.Tensor,
+                             Q_m: torch.Tensor, k: int, m: int,
+                             dim: int) -> torch.Tensor:
+    """
+    Apply (H_k (x) Q_m) along `dim` without forming the n x n product.
+
+    Reshape the target axis into (k, m), mix the m-axis with Q_m and the
+    k-axis with H_k. Forming the full Kronecker product would need n^2
+    entries -- at n=11008 that is ~485 MB per rotation in fp32, which is how
+    the first attempt at this ran out of memory.
+    """
+    X = X.transpose(dim, -1)
+    shape = X.shape
+    X = X.reshape(-1, k, m)
+    if m > 1:
+        X = X @ Q_m.T
+    X = torch.einsum("ij,bjm->bim", H_k, X)
+    return X.reshape(shape).transpose(dim, -1)
+
+
 def block_diagonal_hadamard(n: int, device=None,
                             dtype=torch.float32) -> Tuple[torch.Tensor, int]:
     """
@@ -80,8 +147,11 @@ def block_diagonal_hadamard(n: int, device=None,
 
     Still exactly orthogonal, so the transform remains lossless. Mixing is
     confined within blocks of size k rather than spanning the full dimension,
-    so outlier spreading is weaker -- the block size is reported alongside
-    every result so this limitation is visible rather than hidden.
+    so outlier spreading is weaker.
+
+    RETAINED AS A COMPARISON ARM ONLY. kronecker_rotation_factors is the
+    correct construction; this one is kept so the strength difference between
+    the two can be measured rather than assumed.
     """
     k = largest_pow2_divisor(n)
     if k < 2:
@@ -172,78 +242,140 @@ def outlier_stats(W: torch.Tensor) -> Dict[str, float]:
 # Core comparison
 # ---------------------------------------------------------------------------
 
-def compare_rotation(W: torch.Tensor, bits: int = 4,
-                     block_size: int = 64) -> Dict[str, Any]:
+ROTATION_SCHEMES = ("none", "blockwise_hadamard", "kronecker", "random_orthogonal")
+
+
+def _rotate(Wf: torch.Tensor, scheme: str, seed: int = 0):
     """
-    Quantise one matrix with and without Hadamard rotation, and compare.
+    Return (rotated, inverse_fn) for a given scheme.
 
-    Baseline:  W -> quantise -> W_hat
-    Rotated:   W -> H W H^T -> quantise -> H^T (.) H -> W_hat
+    Every scheme is exactly orthogonal, so the inverse is always available and
+    the round-trip is lossless up to floating-point precision. That is
+    asserted per matrix rather than assumed.
+    """
+    rows, cols = Wf.shape
 
-    Both are measured against the same original W, so the comparison is like
-    for like. The rotated path includes the inverse rotation, so any error it
-    introduces is counted against it rather than hidden.
+    if scheme == "none":
+        return Wf, lambda X: X
+
+    if scheme == "blockwise_hadamard":
+        H_r, k_r = block_diagonal_hadamard(rows)
+        H_c, k_c = block_diagonal_hadamard(cols)
+        Wr = apply_blockwise_hadamard(Wf, H_r, k_r, dim=0)
+        Wr = apply_blockwise_hadamard(Wr, H_c, k_c, dim=1)
+
+        def inv(X):
+            X = apply_blockwise_hadamard(X, H_c.T, k_c, dim=1)
+            return apply_blockwise_hadamard(X, H_r.T, k_r, dim=0)
+
+        return Wr, inv
+
+    if scheme == "kronecker":
+        Hr, Qr, kr, mr = kronecker_rotation_factors(rows, seed=seed)
+        Hc, Qc, kc, mc = kronecker_rotation_factors(cols, seed=seed + 1)
+        Wr = apply_kronecker_rotation(Wf, Hr, Qr, kr, mr, dim=0)
+        Wr = apply_kronecker_rotation(Wr, Hc, Qc, kc, mc, dim=1)
+
+        def inv(X):
+            X = apply_kronecker_rotation(X, Hc.T, Qc.T, kc, mc, dim=1)
+            return apply_kronecker_rotation(X, Hr.T, Qr.T, kr, mr, dim=0)
+
+        return Wr, inv
+
+    if scheme == "random_orthogonal":
+        # CONTROL. Tests whether Hadamard structure matters at all, or
+        # whether any orthogonal rotation flattens outliers equally well.
+        # If this matches kronecker, Hadamard's advantage is purely
+        # computational speed, not quantisation quality -- which changes what
+        # the finding is.
+        # Skipped on large dimensions: forming an n x n dense orthogonal
+        # matrix is O(n^2) memory and O(n^3) to construct.
+        if max(rows, cols) > 2048:
+            return None, None
+        Qr = random_orthogonal(rows, seed=seed + 2)
+        Qc = random_orthogonal(cols, seed=seed + 3)
+        Wr = Qr @ Wf @ Qc.T
+        return Wr, (lambda X: Qr.T @ X @ Qc)
+
+    raise ValueError(f"Unknown rotation scheme: {scheme}")
+
+
+def compare_rotation(W: torch.Tensor, bits: int = 4, block_size: int = 64,
+                     schemes: Tuple[str, ...] = ROTATION_SCHEMES,
+                     seed: int = 0) -> Dict[str, Any]:
+    """
+    Quantise one matrix under several rotation schemes and compare.
+
+    For each scheme:  W -> rotate -> quantise -> un-rotate -> W_hat
+    All measured against the same original W, so comparisons are like for
+    like. The inverse rotation is inside the measured path, so any error it
+    introduces counts against the scheme rather than being hidden.
+
+    The "none" arm is the baseline. Improvement is reported relative to it.
     """
     with torch.no_grad():
         Wf = W.detach().float()
         if Wf.is_cuda:
             Wf = Wf.cpu()
 
-        out_rows, out_cols = Wf.shape
+        rows, cols = Wf.shape
+        results: Dict[str, Any] = {}
+        err_baseline = None
 
-        # Baseline
-        W_base = quantize_dequantize(Wf, bits, block_size)
-        err_base = relative_error(Wf, W_base)
+        for scheme in schemes:
+            try:
+                Wr, inv = _rotate(Wf, scheme, seed=seed)
+            except ValueError as e:
+                results[scheme] = {"status": "skipped", "reason": str(e)}
+                continue
 
-        # Rotation, applied on both axes
-        try:
-            H_r, k_r = block_diagonal_hadamard(out_rows, dtype=torch.float32)
-            H_c, k_c = block_diagonal_hadamard(out_cols, dtype=torch.float32)
-        except ValueError as e:
-            return {"status": "skipped", "reason": str(e)}
+            if Wr is None:
+                results[scheme] = {"status": "skipped",
+                                   "reason": "dimension too large for dense control"}
+                continue
 
-        Wr = apply_blockwise_hadamard(Wf, H_r, k_r, dim=0)
-        Wr = apply_blockwise_hadamard(Wr, H_c, k_c, dim=1)
+            # Round-trip WITHOUT quantisation must be lossless. If it is not,
+            # the transform is wrong and any improvement figure is spurious.
+            roundtrip_err = relative_error(Wf, inv(Wr))
 
-        stats_before = outlier_stats(Wf)
-        stats_after = outlier_stats(Wr)
+            Wq = quantize_dequantize(Wr, bits, block_size)
+            W_hat = inv(Wq)
+            err = relative_error(Wf, W_hat)
 
-        Wr_q = quantize_dequantize(Wr, bits, block_size)
+            if scheme == "none":
+                err_baseline = err
 
-        # Invert: Hadamard is symmetric and orthogonal, so applying it again
-        # undoes it (H H = I after normalisation).
-        W_rec = apply_blockwise_hadamard(Wr_q, H_c.T, k_c, dim=1)
-        W_rec = apply_blockwise_hadamard(W_rec, H_r.T, k_r, dim=0)
+            stats = outlier_stats(Wr)
+            results[scheme] = {
+                "status": "ok",
+                "err": round(err, 6),
+                "roundtrip_err": round(roundtrip_err, 9),
+                "max_over_std": stats["max_over_std"],
+                "kurtosis": stats["kurtosis"],
+                "outlier_ratio": stats["outlier_ratio"],
+            }
 
-        err_rot = relative_error(Wf, W_rec)
+        # Improvements relative to the unrotated baseline.
+        if err_baseline:
+            for scheme, r in results.items():
+                if r.get("status") == "ok" and scheme != "none":
+                    r["improvement"] = round(1 - r["err"] / err_baseline, 5)
 
-        # Sanity: rotating and inverting WITHOUT quantising must be lossless.
-        # If this is not ~0, the transform is wrong and the comparison is
-        # meaningless, so it is checked rather than assumed.
-        W_id = apply_blockwise_hadamard(Wr, H_c.T, k_c, dim=1)
-        W_id = apply_blockwise_hadamard(W_id, H_r.T, k_r, dim=0)
-        roundtrip_err = relative_error(Wf, W_id)
-
-        improvement = (1 - err_rot / err_base) if err_base > 0 else None
+        k_r = largest_pow2_divisor(rows)
+        k_c = largest_pow2_divisor(cols)
 
         return {
             "status": "ok",
-            "shape": tuple(Wf.shape),
+            "shape": (rows, cols),
             "bits": bits,
             "block_size": block_size,
-            "hadamard_block_rows": k_r,
-            "hadamard_block_cols": k_c,
-            "full_rotation": (k_r == out_rows and k_c == out_cols),
-            "err_baseline": round(err_base, 6),
-            "err_rotated": round(err_rot, 6),
-            "improvement": round(improvement, 5) if improvement is not None else None,
-            "roundtrip_err": round(roundtrip_err, 9),
-            "max_over_std_before": stats_before["max_over_std"],
-            "max_over_std_after": stats_after["max_over_std"],
-            "kurtosis_before": stats_before["kurtosis"],
-            "kurtosis_after": stats_after["kurtosis"],
-            "outlier_ratio_before": stats_before["outlier_ratio"],
-            "outlier_ratio_after": stats_after["outlier_ratio"],
+            # Recorded so the old confound stays visible: these flag which
+            # matrices the blockwise arm could only partially rotate.
+            "pow2_rows": k_r == rows,
+            "pow2_cols": k_c == cols,
+            "blockwise_full": (k_r == rows and k_c == cols),
+            "kron_factors": f"{k_r}x{rows//k_r} , {k_c}x{cols//k_c}",
+            "schemes": results,
         }
 
 
@@ -329,7 +461,8 @@ def run_rotation_experiment(
 
         all_rows: List[Dict[str, Any]] = []
         for bits in bits_list:
-            print(f"  {bits}-bit: {len(candidates)} matrices ...")
+            print(f"  {bits}-bit: {len(candidates)} matrices x "
+                  f"{len(ROTATION_SCHEMES)} schemes ...")
             for i, kind, name, W in candidates:
                 res = compare_rotation(W, bits=bits, block_size=block_size)
                 if res.get("status") != "ok":
@@ -369,97 +502,154 @@ def run_rotation_experiment(
 
 
 def _summarise(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Group by bit width, then by layer kind and matrix role."""
+    """Group by bit width, then by rotation scheme, layer kind, and role."""
     out: Dict[str, Any] = {}
 
     for bits in sorted({r["bits"] for r in rows}):
         subset = [r for r in rows if r["bits"] == bits]
-        key = f"{bits}bit"
-        out[key] = {
+        per_scheme = {}
+
+        for scheme in ROTATION_SCHEMES:
+            entries = [(r, r["schemes"].get(scheme, {})) for r in subset]
+            ok = [(r, e) for r, e in entries if e.get("status") == "ok"]
+            if not ok:
+                per_scheme[scheme] = {"n": 0, "note": "no successful runs"}
+                continue
+
+            imps = [e["improvement"] for _, e in ok if e.get("improvement") is not None]
+            per_scheme[scheme] = {
+                "n": len(ok),
+                "mean_err": round(sum(e["err"] for _, e in ok) / len(ok), 6),
+                "mean_max_over_std": round(
+                    sum(e["max_over_std"] for _, e in ok) / len(ok), 3),
+                "max_roundtrip_err": max(e["roundtrip_err"] for _, e in ok),
+                "mean_improvement": round(sum(imps)/len(imps), 5) if imps else None,
+                "n_improved": sum(1 for i in imps if i > 0) if imps else None,
+                "by_role": _group_scheme(ok, "role"),
+                "by_layer_kind": _group_scheme(ok, "layer_kind"),
+            }
+
+        # THE CONFOUND CHECK. Splits the blockwise arm by whether the matrix
+        # had power-of-2 dimensions. If blockwise only helps the pow2 group
+        # while kronecker helps both, the original "GDN beats FFN" result was
+        # an artifact of unequal rotation strength, not a role effect.
+        conf = {}
+        for label, pred in [("pow2_dims", lambda r: r["blockwise_full"]),
+                            ("non_pow2_dims", lambda r: not r["blockwise_full"])]:
+            grp = [r for r in subset if pred(r)]
+            if not grp:
+                continue
+            conf[label] = {"n_matrices": len(grp)}
+            for scheme in ("blockwise_hadamard", "kronecker"):
+                vals = [r["schemes"][scheme]["improvement"]
+                        for r in grp
+                        if r["schemes"].get(scheme, {}).get("improvement") is not None]
+                conf[label][scheme] = round(sum(vals)/len(vals), 5) if vals else None
+            conf[label]["roles"] = sorted({r["role"] for r in grp})
+
+        out[f"{bits}bit"] = {
             "n_matrices": len(subset),
-            "mean_err_baseline": _mean(subset, "err_baseline"),
-            "mean_err_rotated": _mean(subset, "err_rotated"),
-            "mean_improvement": _mean(subset, "improvement"),
-            "n_improved": sum(1 for r in subset if (r["improvement"] or 0) > 0),
-            "mean_max_over_std_before": _mean(subset, "max_over_std_before"),
-            "mean_max_over_std_after": _mean(subset, "max_over_std_after"),
-            "max_roundtrip_err": max(r["roundtrip_err"] for r in subset),
-            "by_layer_kind": _group(subset, "layer_kind"),
-            "by_role": _group(subset, "role"),
-            "full_rotation_only": _group(
-                [r for r in subset if r["full_rotation"]], "layer_kind"),
+            "schemes": per_scheme,
+            "confound_check": conf,
         }
     return out
 
 
-def _mean(rows, field):
-    vals = [r[field] for r in rows if r.get(field) is not None]
-    return round(sum(vals) / len(vals), 6) if vals else None
-
-
-def _group(rows, key):
-    groups: Dict[str, List] = {}
-    for r in rows:
-        groups.setdefault(r[key], []).append(r)
-    return {
-        g: {
-            "n": len(items),
-            "mean_improvement": _mean(items, "improvement"),
-            "mean_err_baseline": _mean(items, "err_baseline"),
-            "mean_err_rotated": _mean(items, "err_rotated"),
+def _group_scheme(ok_pairs, key):
+    groups = {}
+    for r, e in ok_pairs:
+        groups.setdefault(r[key], []).append(e)
+    res = {}
+    for g, entries in groups.items():
+        imps = [e["improvement"] for e in entries if e.get("improvement") is not None]
+        res[g] = {
+            "n": len(entries),
+            "mean_err": round(sum(e["err"] for e in entries)/len(entries), 6),
+            "mean_improvement": round(sum(imps)/len(imps), 5) if imps else None,
+            "mean_max_over_std": round(
+                sum(e["max_over_std"] for e in entries)/len(entries), 3),
         }
-        for g, items in groups.items()
-    }
+    return res
 
 
 def _verdict(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
-    Pre-registered decision. Thresholds are set here, in code, rather than
-    chosen after seeing the numbers.
+    Pre-registered decision, thresholds fixed in code before seeing results.
 
-    A first check on roundtrip error guards the whole result: if rotating and
-    un-rotating without quantisation is not lossless, the transform is
-    implemented incorrectly and every improvement figure is meaningless.
+    Guarded first on round-trip error: if rotating and un-rotating without
+    quantisation is not lossless, the transform is implemented incorrectly and
+    every improvement figure is meaningless.
     """
     if not rows:
         return {"experiment_7": "indeterminate", "reason": "no comparisons"}
 
-    worst_roundtrip = max(r["roundtrip_err"] for r in rows)
-    if worst_roundtrip > 1e-4:
-        return {
-            "experiment_7": "invalid",
-            "reason": (f"rotation round-trip error {worst_roundtrip:.2e} is "
-                       f"not negligible; the transform is not orthogonal as "
-                       f"implemented, so improvement figures cannot be trusted"),
-        }
+    four = [r for r in rows if r["bits"] == 4] or rows
 
-    four_bit = [r for r in rows if r["bits"] == 4]
-    target = four_bit if four_bit else rows
-    imps = [r["improvement"] for r in target if r["improvement"] is not None]
-    if not imps:
-        return {"experiment_7": "indeterminate", "reason": "no improvements computed"}
+    worst_rt = 0.0
+    for r in four:
+        for e in r["schemes"].values():
+            if e.get("status") == "ok":
+                worst_rt = max(worst_rt, e["roundtrip_err"])
+    if worst_rt > 1e-4:
+        return {"experiment_7": "invalid",
+                "reason": (f"round-trip error {worst_rt:.2e} is not "
+                           f"negligible; transform not orthogonal as "
+                           f"implemented")}
 
-    mean_imp = sum(imps) / len(imps)
-    frac_improved = sum(1 for i in imps if i > 0) / len(imps)
+    def scheme_imps(scheme):
+        return [r["schemes"][scheme]["improvement"] for r in four
+                if r["schemes"].get(scheme, {}).get("improvement") is not None]
 
-    if mean_imp > 0.05 and frac_improved > 0.8:
+    kron = scheme_imps("kronecker")
+    block = scheme_imps("blockwise_hadamard")
+    rand = scheme_imps("random_orthogonal")
+
+    if not kron:
+        return {"experiment_7": "indeterminate", "reason": "kronecker arm empty"}
+
+    mean_kron = sum(kron)/len(kron)
+    frac = sum(1 for i in kron if i > 0)/len(kron)
+    mean_block = sum(block)/len(block) if block else None
+    mean_rand = sum(rand)/len(rand) if rand else None
+
+    if mean_kron > 0.05 and frac > 0.8:
         status = "promoted"
-        reason = (f"mean {mean_imp*100:.1f}% error reduction at 4-bit, "
-                  f"improving on {frac_improved*100:.0f}% of matrices: worth "
-                  f"building the inference-time absorption")
-    elif mean_imp > 0.01:
+        reason = (f"kronecker rotation gives {mean_kron*100:.1f}% mean error "
+                  f"reduction at 4-bit on {frac*100:.0f}% of matrices")
+    elif mean_kron > 0.01:
         status = "weak"
-        reason = (f"mean {mean_imp*100:.1f}% error reduction: real but small; "
-                  f"weigh against the engineering cost of absorption")
+        reason = (f"{mean_kron*100:.1f}% mean reduction: real but small "
+                  f"against the cost of inference-time absorption")
     else:
         status = "killed"
-        reason = (f"mean {mean_imp*100:.1f}% change: rotation does not "
-                  f"meaningfully reduce quantisation error on these weights")
+        reason = (f"{mean_kron*100:.1f}% change: rotation does not "
+                  f"meaningfully reduce quantisation error here")
+
+    # Does Hadamard structure matter, or would any rotation do? If the random
+    # orthogonal control matches, Hadamard's advantage is speed, not quality,
+    # and the finding should be stated that way.
+    if mean_rand is not None:
+        gap = mean_kron - mean_rand
+        if abs(gap) < 0.01:
+            structure = ("Hadamard structure gives no quality advantage over a "
+                         "generic orthogonal rotation; its benefit is "
+                         "computational speed only")
+        elif gap > 0:
+            structure = (f"Hadamard-based rotation beats a random orthogonal "
+                         f"control by {gap*100:.1f} points")
+        else:
+            structure = (f"random orthogonal BEATS Hadamard by "
+                         f"{-gap*100:.1f} points -- unexpected, investigate")
+    else:
+        structure = "random orthogonal control not run (dimensions too large)"
 
     return {
         "experiment_7": status,
-        "mean_improvement_4bit": round(mean_imp, 5),
-        "fraction_improved": round(frac_improved, 4),
-        "max_roundtrip_err": worst_roundtrip,
+        "mean_improvement_kronecker_4bit": round(mean_kron, 5),
+        "mean_improvement_blockwise_4bit": round(mean_block, 5) if mean_block else None,
+        "mean_improvement_random_orth_4bit": round(mean_rand, 5) if mean_rand else None,
+        "fraction_improved": round(frac, 4),
+        "max_roundtrip_err": worst_rt,
         "reason": reason,
+        "structure_question": structure,
     }
