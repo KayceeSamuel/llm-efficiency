@@ -103,6 +103,24 @@ def quantize_dequantize_nf4(W: torch.Tensor,
 # Scheme registry
 # ---------------------------------------------------------------------------
 
+def parse_scheme(scheme: str) -> Tuple[str, bool]:
+    """
+    Split a scheme name into its core and whether embeddings are included.
+
+    The '+emb' suffix quantises the embedding table AND the untied LM head
+    alongside the decoder layers. Without it, both are left at bf16, which is
+    what bitsandbytes does by default and therefore what the production
+    baseline looks like.
+
+    Making this a per-scheme suffix rather than a global flag matters: it lets
+    'nf4' and 'nf4+emb' be compared inside a single run, against a shared
+    fp16 baseline, rather than across two runs whose baselines could drift.
+    """
+    if scheme.endswith("+emb"):
+        return scheme[:-4], True
+    return scheme, False
+
+
 SCHEMES = {
     "fp16": {"desc": "unmodified reference", "bits": 16},
     "int4": {"desc": "uniform int4, blockwise absmax", "bits": 4},
@@ -110,6 +128,9 @@ SCHEMES = {
     "int2": {"desc": "uniform int2", "bits": 2},
     "nf4": {"desc": "NF4 codebook (simulates bitsandbytes production path)",
             "bits": 4},
+    "nf4+emb": {"desc": "NF4 including embeddings and untied LM head "
+                        "(3.79 GB of the 9B model, left at bf16 by default)",
+                "bits": 4},
     "int4+rot": {"desc": "uniform int4 with Kronecker rotation", "bits": 4},
     "int3+rot": {"desc": "uniform int3 with Kronecker rotation", "bits": 3},
     "nf4+rot": {"desc": "NF4 with rotation -- tests whether rotation adds "
@@ -407,7 +428,7 @@ def run_quality_validation(
     from datetime import datetime, timezone
     from pathlib import Path
 
-    from .config import RunConfig, capture_environment
+    from .config import RunConfig, capture_environment, run_stamp
     from .loader import load, free_gpu
     from .quality import run_lm_eval, headline_score
 
@@ -415,7 +436,7 @@ def run_quality_validation(
         tasks = ["arc_easy", "hellaswag", "piqa"]
 
     record: Dict[str, Any] = {
-        "run_id": f"T2-QUALITY-{base}",
+        "run_id": f"T2-QUALITY-{base}-{run_stamp()}",
         "started_utc": datetime.now(timezone.utc).isoformat(),
         "provenance": "measured",
         "environment": capture_environment(),
@@ -431,6 +452,11 @@ def run_quality_validation(
     }
 
     for scheme in schemes:
+        core, wants_emb = parse_scheme(scheme)
+        # Global flag still forces embeddings on for every scheme; the
+        # per-scheme suffix is the finer control.
+        include_emb = wants_emb or quantise_embeddings
+
         print(f"\n=== {scheme} ===")
         cfg = RunConfig(
             experiment_id=f"T2-QUAL-{scheme}",
@@ -441,7 +467,8 @@ def run_quality_validation(
 
         model = None
         entry: Dict[str, Any] = {"scheme": scheme,
-                                 "desc": SCHEMES.get(scheme, {}).get("desc")}
+                                 "desc": SCHEMES.get(scheme, {}).get("desc"),
+                                 "embeddings_included": include_emb}
         try:
             model, tok, load_info = load(cfg)
 
@@ -450,8 +477,8 @@ def run_quality_validation(
 
             print("  applying scheme to weights ...")
             entry["modification"] = apply_scheme_in_place(
-                model, scheme, block_size,
-                skip_embeddings=not quantise_embeddings)
+                model, core, block_size,
+                skip_embeddings=not include_emb)
             print(f"  mean reconstruction error: "
                   f"{entry['modification']['mean_rel_error']}")
 
@@ -460,8 +487,11 @@ def run_quality_validation(
                              limit=eval_limit, batch_size=1)
             entry["eval"] = ev
             entry["headline"] = headline_score(ev)
+            entry["perplexity"] = _extract_perplexity(ev)
             entry["status"] = "ok"
-            print(f"  headline: {entry['headline']}")
+            print(f"  headline: {entry['headline']}"
+                  + (f"   ppl: {entry['perplexity']}"
+                     if entry["perplexity"] else ""))
 
         except Exception as e:
             import traceback
@@ -487,6 +517,31 @@ def run_quality_validation(
             json.dump(record, f, indent=2)
 
     return record
+
+
+def _extract_perplexity(eval_result: Dict[str, Any]) -> Optional[float]:
+    """
+    Pull word-level perplexity out of an lm-eval result, if a perplexity task
+    was run.
+
+    Perplexity is the sensitive instrument for damage to the LM head. A
+    multiple-choice task only asks which of four options scores highest, so
+    it tolerates substantial distortion of the output distribution as long as
+    the ranking survives. Perplexity measures the distribution over all
+    248,320 vocabulary entries directly, so it registers degradation that
+    accuracy hides.
+
+    Lower is better, which is the reverse of every other metric here, so it is
+    kept out of the headline average and reported separately.
+    """
+    if eval_result.get("status") != "ok":
+        return None
+    for task, metrics in eval_result.get("scores", {}).items():
+        for key in ("word_perplexity,none", "perplexity,none",
+                    "byte_perplexity,none"):
+            if key in metrics:
+                return round(metrics[key], 4)
+    return None
 
 
 def _analyse(runs: Dict[str, Any], n_items: Optional[int] = None) -> Dict[str, Any]:
@@ -516,6 +571,8 @@ def _analyse(runs: Dict[str, Any], n_items: Optional[int] = None) -> Dict[str, A
             "scheme": scheme,
             "recon_error": err,
             "headline": r["headline"],
+            "perplexity": r.get("perplexity"),
+            "embeddings_included": r.get("embeddings_included", False),
             "quality_drop": (round(1 - r["headline"] / ref_score, 5)
                              if ref_score else None),
         })
@@ -612,6 +669,48 @@ def _analyse(runs: Dict[str, Any], n_items: Optional[int] = None) -> Dict[str, A
     corr_plain = _corr([r for r in rows if not r["scheme"].endswith("+rot")])
     corr_rot = _corr([r for r in rows if r["scheme"].endswith("+rot")])
 
+    # Embedding + LM head quantisation: the largest memory target found.
+    # Accuracy and perplexity are BOTH checked, because a multiple-choice
+    # battery can miss output-distribution damage that perplexity catches.
+    emb_note = None
+    emb_pairs = []
+    for bare in ("nf4", "int4"):
+        a = next((r for r in rows if r["scheme"] == bare), None)
+        b = next((r for r in rows if r["scheme"] == bare + "+emb"), None)
+        if a and b:
+            ppl_delta = None
+            if a["perplexity"] and b["perplexity"]:
+                ppl_delta = round(b["perplexity"] / a["perplexity"] - 1, 5)
+            emb_pairs.append({
+                "bit_scheme": bare,
+                "headline_without_emb": a["headline"],
+                "headline_with_emb": b["headline"],
+                "accuracy_delta": round(b["headline"] - a["headline"], 5),
+                "perplexity_without_emb": a["perplexity"],
+                "perplexity_with_emb": b["perplexity"],
+                "perplexity_relative_increase": ppl_delta,
+                "within_noise": (abs(b["headline"] - a["headline"]) < 2 * stderr
+                                 if stderr else None),
+            })
+
+    if emb_pairs:
+        p = emb_pairs[0]
+        parts = [f"Quantising embeddings + LM head changes accuracy by "
+                 f"{p['accuracy_delta']:+.5f}"]
+        if p["within_noise"] is not None:
+            parts.append("within noise" if p["within_noise"] else "OUTSIDE noise")
+        if p["perplexity_relative_increase"] is not None:
+            pr = p["perplexity_relative_increase"]
+            parts.append(
+                f"perplexity {pr:+.2%}"
+                + (" -- output distribution intact" if abs(pr) < 0.05 else
+                   " -- OUTPUT DISTRIBUTION DEGRADED; accuracy alone would "
+                   "have missed this"))
+        else:
+            parts.append("no perplexity task run, so output-distribution "
+                         "damage is untested")
+        emb_note = ". ".join(parts)
+
     return {
         "reference_score": ref_score,
         "rows": rows,
@@ -639,4 +738,6 @@ def _analyse(runs: Dict[str, Any], n_items: Optional[int] = None) -> Dict[str, A
         "nf4_vs_int4": nf4_note,
         "rotation_pairs": rot_pairs,
         "rotation_on_top_of_nf4": rot_note,
+        "embedding_pairs": emb_pairs,
+        "embedding_verdict": emb_note,
     }

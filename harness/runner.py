@@ -18,7 +18,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Any, Optional
 
-from .config import RunConfig, capture_environment
+from .config import RunConfig, capture_environment, run_stamp
 from .loader import load, free_gpu
 from .profiler import (
     profile_context_scaling, make_synthetic_prompt, latency_repeats,
@@ -40,7 +40,7 @@ def run_experiment(
 
     started = datetime.now(timezone.utc).isoformat()
     record: Dict[str, Any] = {
-        "run_id": f"{cfg.experiment_id}-{cfg.fingerprint()}",
+        "run_id": f"{cfg.experiment_id}-{cfg.fingerprint()}-{run_stamp()}",
         "started_utc": started,
         "config": cfg.to_dict(),
         "environment": capture_environment(),

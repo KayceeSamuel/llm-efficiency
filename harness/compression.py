@@ -325,7 +325,7 @@ def run_compression_frontier(
     from datetime import datetime, timezone
     from pathlib import Path
 
-    from .config import RunConfig, capture_environment
+    from .config import RunConfig, capture_environment, run_stamp
     from .loader import load, free_gpu
     from .weights import classify_layers, _get_layer_list, _matrix_role
 
@@ -338,7 +338,7 @@ def run_compression_frontier(
     )
 
     record: Dict[str, Any] = {
-        "run_id": f"T2-FRONTIER-{cfg.fingerprint()}",
+        "run_id": f"T2-FRONTIER-{cfg.fingerprint()}-{run_stamp()}",
         "started_utc": datetime.now(timezone.utc).isoformat(),
         "config": cfg.to_dict(),
         "environment": capture_environment(),

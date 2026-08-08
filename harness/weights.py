@@ -726,7 +726,7 @@ def run_weight_analysis(
     from datetime import datetime, timezone
     from pathlib import Path
 
-    from .config import RunConfig, capture_environment
+    from .config import RunConfig, capture_environment, run_stamp
     from .loader import load, free_gpu
 
     cfg = RunConfig(
@@ -741,7 +741,7 @@ def run_weight_analysis(
     )
 
     record: Dict[str, Any] = {
-        "run_id": f"T1-WEIGHTS-{cfg.fingerprint()}",
+        "run_id": f"T1-WEIGHTS-{cfg.fingerprint()}-{run_stamp()}",
         "started_utc": datetime.now(timezone.utc).isoformat(),
         "config": cfg.to_dict(),
         "environment": capture_environment(),

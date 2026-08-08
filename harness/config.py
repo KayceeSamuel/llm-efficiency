@@ -175,6 +175,23 @@ class RunConfig:
         return d
 
 
+def run_stamp() -> str:
+    """
+    Short UTC timestamp appended to every result filename.
+
+    Without this, re-running an experiment with an unchanged config produces
+    the same filename and SILENTLY OVERWRITES the previous record. That has
+    already cost one run in this project. Results are expensive to produce and
+    cheap to store, so every execution now gets its own file and nothing is
+    ever destroyed by a rerun.
+
+    The config fingerprint still identifies which runs are comparable; this
+    only distinguishes separate executions of the same condition.
+    """
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+
+
 def capture_environment() -> Dict[str, Any]:
     """
     Environment capture. Library versions silently change results --
