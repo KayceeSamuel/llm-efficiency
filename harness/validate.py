@@ -202,10 +202,19 @@ def apply_scheme_in_place(model, scheme: str, block_size: int = 64,
                     stats["skipped"] += 1
                     continue
 
-                orig = W.detach().float().clone()
+                # Streaming error: accumulate squared norms rather than
+                # keeping a full fp32 copy of the original. Cheap here since
+                # decoder matrices are small, but it keeps peak memory flat
+                # regardless of matrix size.
                 new = _apply_scheme_to_matrix(W, scheme, block_size)
-                errors.append(relative_error(orig, new.float()))
+                with torch.no_grad():
+                    diff = (W.detach().float() - new.float())
+                    num = float(diff.pow(2).sum())
+                    den = float(W.detach().float().pow(2).sum())
+                    del diff
+                errors.append((num ** 0.5) / (den ** 0.5) if den > 0 else 0.0)
                 W.copy_(new)
+                del new
 
                 stats["matrices_modified"] += 1
                 stats["params_modified"] += W.numel()
@@ -214,15 +223,28 @@ def apply_scheme_in_place(model, scheme: str, block_size: int = 64,
         if not skip_embeddings:
             emb = model.get_input_embeddings()
             if emb is not None and hasattr(emb, "weight"):
-                W = emb.weight
-                orig = W.detach().float().clone()
-                new = _apply_scheme_to_matrix(W, scheme, block_size)
-                errors.append(relative_error(orig, new.float()))
-                W.copy_(new)
+                stats.update(_quantise_big_matrix(
+                    emb.weight, scheme, block_size, errors, label="embeddings"))
                 stats["matrices_modified"] += 1
-                stats["params_modified"] += W.numel()
-                stats["embeddings_quantised"] = True
-                del orig
+                stats["params_modified"] += emb.weight.numel()
+
+            # The LM head is a SEPARATE untied matrix on this model
+            # (measure_module_memory reports tied_to_embeddings=False), so it
+            # is not reached by the embedding path above and must be handled
+            # explicitly. Together the two are 3.79 GB, 53% of the NF4 model.
+            head = getattr(model, "lm_head", None)
+            head_w = getattr(head, "weight", None) if head is not None else None
+            if head_w is not None and torch.is_tensor(head_w):
+                emb_w = emb.weight if emb is not None else None
+                tied = (emb_w is not None
+                        and head_w.data_ptr() == emb_w.data_ptr())
+                if not tied:
+                    stats.update(_quantise_big_matrix(
+                        head_w, scheme, block_size, errors, label="lm_head"))
+                    stats["matrices_modified"] += 1
+                    stats["params_modified"] += head_w.numel()
+                else:
+                    stats["lm_head_tied"] = True
 
     if errors:
         stats["mean_rel_error"] = round(sum(errors) / len(errors), 6)
@@ -230,6 +252,68 @@ def apply_scheme_in_place(model, scheme: str, block_size: int = 64,
     gc.collect()
     torch.cuda.empty_cache()
     return stats
+
+
+def _quantise_big_matrix(W: torch.Tensor, scheme: str, block_size: int,
+                         errors: list, label: str,
+                         chunk_rows: int = 8192) -> Dict[str, Any]:
+    """
+    Quantise a very large matrix in row chunks, on CPU, without ever holding
+    a full fp32 copy.
+
+    Necessary because the embedding table and LM head are 248,320 x 4096 each
+    -- 1.895 GB in bf16, but 3.79 GB once converted to fp32. A naive
+    `W.detach().float().clone()` allocates that on top of an already-resident
+    model and OOMs on a 22 GB card.
+
+    Three things make this fit:
+      - chunks: only `chunk_rows` rows are in fp32 at any moment
+      - CPU: the temporary never touches VRAM
+      - streaming error: squared norms accumulate per chunk, so the relative
+        error is exact without materialising the whole difference
+
+    Rotation is deliberately NOT applied here. Rotating a 248k-row matrix is
+    expensive, and the quality validation already showed rotation does not
+    help on the benchmark, so there is nothing to gain from it.
+    """
+    if scheme == "fp16":
+        return {f"{label}_quantised": False, f"{label}_note": "reference, unmodified"}
+
+    core = scheme[:-4] if scheme.endswith("+rot") else scheme
+
+    n_rows = W.shape[0]
+    sq_err = 0.0
+    sq_ref = 0.0
+
+    with torch.no_grad():
+        for start in range(0, n_rows, chunk_rows):
+            end = min(start + chunk_rows, n_rows)
+            chunk = W[start:end].detach().to("cpu", torch.float32)
+
+            if core == "nf4":
+                q = quantize_dequantize_nf4(chunk, block_size)
+            else:
+                bits = int(core.replace("int", ""))
+                q = quantize_dequantize(chunk, bits, block_size)
+
+            sq_err += float(((chunk - q) ** 2).sum())
+            sq_ref += float((chunk ** 2).sum())
+
+            W[start:end].copy_(q.to(W.device, W.dtype))
+            del chunk, q
+
+    err = (sq_err ** 0.5) / (sq_ref ** 0.5) if sq_ref > 0 else 0.0
+    errors.append(err)
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    return {
+        f"{label}_quantised": True,
+        f"{label}_rel_error": round(err, 6),
+        f"{label}_shape": tuple(W.shape),
+        f"{label}_gb_at_bf16": round(W.numel() * 2 / 1024**3, 3),
+    }
 
 
 def measure_module_memory(model) -> Dict[str, Any]:
