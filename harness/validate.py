@@ -393,7 +393,8 @@ def run_quality_validation(
 
         record["runs"][scheme] = entry
 
-    record["analysis"] = _analyse(record["runs"])
+    n_items = (len(tasks) * eval_limit) if eval_limit else None
+    record["analysis"] = _analyse(record["runs"], n_items=n_items)
     record["finished_utc"] = datetime.now(timezone.utc).isoformat()
 
     if results_dir is not None:
@@ -405,16 +406,23 @@ def run_quality_validation(
     return record
 
 
-def _analyse(runs: Dict[str, Any]) -> Dict[str, Any]:
+def _analyse(runs: Dict[str, Any], n_items: Optional[int] = None) -> Dict[str, Any]:
     """
     The central question: does reconstruction error predict benchmark quality?
 
-    Reports the correlation between the two across schemes. A strong negative
-    correlation validates every reconstruction-error result in this project.
-    A weak one means the frontier was measuring the wrong quantity.
+    Answered per family as well as pooled, because a high pooled correlation
+    can mask two clean relationships that are offset from one another -- which
+    is precisely what rotation turned out to do.
+
+    Standard error is reported so that differences within noise are not read
+    as findings.
     """
     ref = runs.get("fp16", {})
     ref_score = ref.get("headline")
+
+    stderr = None
+    if n_items and ref_score:
+        stderr = math.sqrt(ref_score * (1 - ref_score) / n_items)
 
     rows = []
     for scheme, r in runs.items():
@@ -446,7 +454,6 @@ def _analyse(runs: Dict[str, Any]) -> Dict[str, Any]:
 
     # Does rotation add anything on top of NF4's normal-fitted codebook?
     nf4 = next((r for r in rows if r["scheme"] == "nf4"), None)
-    nf4r = next((r for r in rows if r["scheme"] == "nf4+rot"), None)
     int4 = next((r for r in rows if r["scheme"] == "int4"), None)
 
     nf4_note = None
@@ -454,21 +461,86 @@ def _analyse(runs: Dict[str, Any]) -> Dict[str, Any]:
         nf4_note = (f"NF4 headline {nf4['headline']} vs uniform int4 "
                     f"{int4['headline']}: NF4's codebook is worth "
                     f"{round(nf4['headline'] - int4['headline'], 5)} on the battery")
+
+    # Paired comparison: does rotation help at MATCHED bit width?
+    #
+    # This is the question experiment 7 could not answer, because it measured
+    # reconstruction error only. Sign matters here -- an earlier version of
+    # this function tested abs(delta) and reported a QUALITY REGRESSION as
+    # "rotation adds real benefit", which is the opposite of the truth.
+    rot_pairs = []
+    for bare in ("nf4", "int4", "int3", "int2"):
+        a = next((r for r in rows if r["scheme"] == bare), None)
+        b = next((r for r in rows if r["scheme"] == bare + "+rot"), None)
+        if a and b:
+            rot_pairs.append({
+                "bit_scheme": bare,
+                "headline_plain": a["headline"],
+                "headline_rotated": b["headline"],
+                "quality_delta": round(b["headline"] - a["headline"], 5),
+                "recon_plain": a["recon_error"],
+                "recon_rotated": b["recon_error"],
+                "recon_delta": round(b["recon_error"] - a["recon_error"], 6),
+                # The reversal to watch for: rotation lowering reconstruction
+                # error while also lowering benchmark quality.
+                "directions_disagree": (
+                    b["recon_error"] < a["recon_error"]
+                    and b["headline"] < a["headline"]),
+            })
+
     rot_note = None
-    if nf4 and nf4r:
-        delta = nf4r["headline"] - nf4["headline"]
-        rot_note = (
-            f"rotation on top of NF4 changes headline by {delta:+.5f}. "
-            + ("Rotation adds little beyond NF4's codebook -- experiment 7's "
-               "promotion was measured against uniform int4 and overstates "
-               "the gain versus the production path."
-               if abs(delta) < 0.01 else
-               "Rotation adds real benefit beyond NF4."))
+    if rot_pairs:
+        n_worse = sum(1 for p in rot_pairs if p["quality_delta"] < 0)
+        n_disagree = sum(1 for p in rot_pairs if p["directions_disagree"])
+        mean_delta = sum(p["quality_delta"] for p in rot_pairs) / len(rot_pairs)
+
+        if n_worse == len(rot_pairs) and n_disagree == len(rot_pairs):
+            rot_note = (
+                f"REVERSAL: in {n_disagree}/{len(rot_pairs)} matched pairs, "
+                f"rotation LOWERED reconstruction error but ALSO lowered "
+                f"benchmark quality (mean delta {mean_delta:+.5f}). "
+                f"Reconstruction error is not a valid proxy across the "
+                f"rotation boundary. Experiment 7's promotion, which rested "
+                f"on reconstruction error alone, does not hold on quality."
+            )
+        elif mean_delta > 0.01:
+            rot_note = (f"rotation improves headline by {mean_delta:+.5f} on "
+                        f"average across matched bit widths")
+        else:
+            rot_note = (f"rotation changes headline by {mean_delta:+.5f} on "
+                        f"average: no clear benefit at matched bit width")
+
+    # Correlation computed separately within each family. A high pooled
+    # correlation can hide two clean but OFFSET relationships, which is
+    # exactly what rotation produces here.
+    def _corr(subset):
+        pts = [(r["recon_error"], r["quality_drop"]) for r in subset
+               if r["quality_drop"] is not None]
+        if len(pts) < 3:
+            return None
+        xs = [p[0] for p in pts]
+        ys = [p[1] for p in pts]
+        mx, my = sum(xs)/len(xs), sum(ys)/len(ys)
+        num = sum((x-mx)*(y-my) for x, y in pts)
+        dx = math.sqrt(sum((x-mx)**2 for x in xs))
+        dy = math.sqrt(sum((y-my)**2 for y in ys))
+        return round(num/(dx*dy), 4) if dx > 0 and dy > 0 else None
+
+    corr_plain = _corr([r for r in rows if not r["scheme"].endswith("+rot")])
+    corr_rot = _corr([r for r in rows if r["scheme"].endswith("+rot")])
 
     return {
         "reference_score": ref_score,
         "rows": rows,
+        "n_eval_items": n_items,
+        "single_score_stderr": round(stderr, 5) if stderr else None,
+        "significance_note": (
+            f"Differences smaller than ~{round(2*stderr, 4)} (2 SE) should be "
+            f"treated as noise at this eval size."
+            if stderr else "eval size unknown; treat small differences as noise"),
         "error_vs_quality_correlation": corr,
+        "correlation_within_plain": corr_plain,
+        "correlation_within_rotated": corr_rot,
         "correlation_interpretation": (
             None if corr is None else
             "strong: reconstruction error is a valid proxy for quality, "
@@ -476,6 +548,12 @@ def _analyse(runs: Dict[str, Any]) -> Dict[str, Any]:
             "moderate: reconstruction error is a rough guide only" if corr > 0.5
             else "weak: reconstruction error does NOT predict quality on this "
                  "architecture; frontier conclusions require re-examination"),
+        "correlation_caveat": (
+            "A high pooled correlation is driven mainly by bit width. Check "
+            "the within-family correlations and the rotation pairs below: if "
+            "both families correlate cleanly but are offset, the proxy is "
+            "valid WITHIN a family and invalid ACROSS it."),
         "nf4_vs_int4": nf4_note,
+        "rotation_pairs": rot_pairs,
         "rotation_on_top_of_nf4": rot_note,
     }
