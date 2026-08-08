@@ -218,7 +218,6 @@ def apply_scheme_in_place(model, scheme: str, block_size: int = 64,
 
                 stats["matrices_modified"] += 1
                 stats["params_modified"] += W.numel()
-                del orig
 
         if not skip_embeddings:
             emb = model.get_input_embeddings()
