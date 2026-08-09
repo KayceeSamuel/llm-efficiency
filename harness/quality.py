@@ -34,6 +34,7 @@ def run_lm_eval(
     num_fewshot: int = 0,
     limit: Optional[int] = None,
     batch_size: int = 1,
+    max_length: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
     Evaluate an ALREADY-LOADED model object.
@@ -42,6 +43,17 @@ def run_lm_eval(
     own loading path and could silently apply a different quantization or
     attention config than the one under test, so the thing evaluated would
     not be the thing profiled.
+
+    max_length caps the sequence length used for rolling-loglikelihood tasks.
+    This is not cosmetic. Perplexity scores EVERY token, so it materialises
+    logits for the whole window at once: seq_len x vocab x 4 bytes. On a
+    248,320-token vocabulary a 4096-token window is 4.07 GB, which OOMs
+    alongside a 17 GB fp16 model on a 22 GB card. Multiple-choice tasks never
+    hit this because they score short sequences.
+
+    Perplexity values depend on the window, so runs compared against each
+    other must use the SAME max_length. Relative comparison stays valid;
+    absolute values are not comparable to published figures at other lengths.
     """
     if not _lm_eval_available():
         return {
@@ -52,11 +64,12 @@ def run_lm_eval(
     import lm_eval
     from lm_eval.models.huggingface import HFLM
 
-    lm = HFLM(
-        pretrained=model,
-        tokenizer=tokenizer,
-        batch_size=batch_size,
-    )
+    hflm_kwargs = {"pretrained": model, "tokenizer": tokenizer,
+                   "batch_size": batch_size}
+    if max_length is not None:
+        hflm_kwargs["max_length"] = max_length
+
+    lm = HFLM(**hflm_kwargs)
 
     try:
         out = lm_eval.simple_evaluate(

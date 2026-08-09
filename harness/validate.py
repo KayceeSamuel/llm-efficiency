@@ -103,6 +103,12 @@ def quantize_dequantize_nf4(W: torch.Tensor,
 # Scheme registry
 # ---------------------------------------------------------------------------
 
+# Tasks that use rolling loglikelihood and therefore materialise logits for
+# every position. These need a capped window on a large-vocabulary model and
+# are run in an isolated lm_eval call.
+PERPLEXITY_TASKS = {"wikitext", "pile", "lambada_openai", "lambada_standard"}
+
+
 def parse_scheme(scheme: str) -> Tuple[str, bool]:
     """
     Split a scheme name into its core and whether embeddings are included.
@@ -411,6 +417,7 @@ def run_quality_validation(
     eval_limit: Optional[int] = 200,
     block_size: int = 64,
     quantise_embeddings: bool = False,
+    perplexity_max_length: int = 1024,
     results_dir=None,
 ) -> Dict[str, Any]:
     """
@@ -442,7 +449,8 @@ def run_quality_validation(
         "environment": capture_environment(),
         "eval_config": {"tasks": tasks, "limit": eval_limit,
                         "block_size": block_size,
-                        "embeddings_quantised": quantise_embeddings},
+                        "embeddings_quantised": quantise_embeddings,
+                        "perplexity_max_length": perplexity_max_length},
         "scope_note": (
             "Weights are modified in place in fp16 storage. NO memory is "
             "saved; this measures the QUALITY consequence of quantisation "
@@ -483,15 +491,49 @@ def run_quality_validation(
                   f"{entry['modification']['mean_rel_error']}")
 
             print("  evaluating ...")
-            ev = run_lm_eval(model, tok, tasks=tasks, num_fewshot=0,
-                             limit=eval_limit, batch_size=1)
+
+            # Accuracy and perplexity are run in SEPARATE lm_eval calls.
+            #
+            # simple_evaluate raises before returning anything, so a failure
+            # in one task destroys the results of every task in the same call.
+            # That already cost an hour of inference here: wikitext OOM'd on
+            # logit allocation and took four schemes' worth of completed
+            # ARC/HellaSwag/PIQA results down with it.
+            acc_tasks = [t for t in tasks if t not in PERPLEXITY_TASKS]
+            ppl_tasks = [t for t in tasks if t in PERPLEXITY_TASKS]
+
+            ev = {"status": "ok", "scores": {}}
+            if acc_tasks:
+                ev_acc = run_lm_eval(model, tok, tasks=acc_tasks,
+                                     num_fewshot=0, limit=eval_limit,
+                                     batch_size=1)
+                entry["eval_accuracy"] = ev_acc
+                if ev_acc.get("status") == "ok":
+                    ev["scores"].update(ev_acc["scores"])
+                else:
+                    ev["status"] = "error"
+                    ev["error"] = ev_acc.get("error")
+
+            if ppl_tasks:
+                # Capped window: see run_lm_eval docstring. Failure here is
+                # recorded and does not affect the accuracy results above.
+                ev_ppl = run_lm_eval(model, tok, tasks=ppl_tasks,
+                                     num_fewshot=0, limit=eval_limit,
+                                     batch_size=1,
+                                     max_length=perplexity_max_length)
+                entry["eval_perplexity"] = ev_ppl
+                if ev_ppl.get("status") == "ok":
+                    ev["scores"].update(ev_ppl["scores"])
+                else:
+                    entry["perplexity_error"] = ev_ppl.get("error")
+
             entry["eval"] = ev
             entry["headline"] = headline_score(ev)
             entry["perplexity"] = _extract_perplexity(ev)
-            entry["status"] = "ok"
+            entry["status"] = "ok" if ev["status"] == "ok" else "error"
             print(f"  headline: {entry['headline']}"
                   + (f"   ppl: {entry['perplexity']}"
-                     if entry["perplexity"] else ""))
+                     if entry["perplexity"] else "   ppl: n/a"))
 
         except Exception as e:
             import traceback
