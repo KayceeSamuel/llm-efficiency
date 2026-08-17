@@ -152,8 +152,8 @@ extern const float NF4DQ_SCALE_LEVELS[16];
 
 // Reference (non-SIMD) quantise and dequantise.
 //   k must be a multiple of QK_NF4DQ.
-void quantize_row_nf4dq_ref  (const float * restrict x, block_nf4dq * restrict y, int64_t k);
-void dequantize_row_nf4dq    (const block_nf4dq * restrict x, float * restrict y, int64_t k);
+void quantize_row_nf4dq_ref  (const float * NF4DQ_RESTRICT x, block_nf4dq * NF4DQ_RESTRICT y, int64_t k);
+void dequantize_row_nf4dq    (const block_nf4dq * NF4DQ_RESTRICT x, float * NF4DQ_RESTRICT y, int64_t k);
 
 // Convenience: quantise then dequantise, reporting relative Frobenius error.
 // This is the gate. It should return ~0.0918 on real transformer weights.
@@ -161,7 +161,7 @@ float nf4dq_roundtrip_error(const float * x, int64_t k);
 
 // Row-loop wrapper, matching ggml's quantize_<type> convention.
 // Returns bytes written, or 0 if n_per_row is not a multiple of QK_NF4DQ.
-size_t quantize_nf4dq(const float * restrict src, void * restrict dst,
+size_t quantize_nf4dq(const float * NF4DQ_RESTRICT src, void * NF4DQ_RESTRICT dst,
                       int64_t nrow, int64_t n_per_row);
 
 #ifdef __cplusplus
