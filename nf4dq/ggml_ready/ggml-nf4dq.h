@@ -106,6 +106,15 @@
 #include "ggml-common.h"
 #include "ggml.h"
 
+// "restrict" is C only. CUDA and C++ translation units spell it
+// __restrict__. Without this the header fails to parse from every .cu that
+// includes it.
+#ifdef __cplusplus
+#define NF4DQ_RESTRICT __restrict__
+#else
+#define NF4DQ_RESTRICT restrict
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
