@@ -18,13 +18,23 @@ ggml/src/ggml-nf4dq.c      <- from this repo, minus the standalone fp16 helpers
 ggml/src/ggml-nf4dq.h      <- ditto
 ```
 
-Two edits when moving them in:
+`nf4dq/ggml_ready/` holds versions with those edits already applied and
+syntax-checked against the real ggml headers:
 
-- Delete the local `fp32_to_fp16` / `fp16_to_fp32` and use ggml's
-  `GGML_FP32_TO_FP16` / `GGML_FP16_TO_FP32` from `ggml-impl.h`. The local ones
-  exist so the file compiles standalone for the CPU gate; inside ggml they
-  would shadow better-tested versions.
-- Replace `nf4dq_half` with `ggml_half`, and drop the local typedef.
+- local `fp32_to_fp16` / `fp16_to_fp32` replaced by ggml's
+  `GGML_FP32_TO_FP16` / `GGML_FP16_TO_FP32`
+- `nf4dq_half` replaced by `ggml_half`, local typedef dropped
+- `#define GGML_COMMON_DECL_C` added before the `ggml-common.h` include.
+  Without it `ggml_half` and every block typedef are compiled out, and the
+  first symptom is the `static_assert` failing with "size of array is
+  negative", which points at the struct rather than the include. ggml-quants.h
+  does the same thing for the same reason.
+
+Verify after copying:
+
+```bash
+gcc -fsyntax-only -std=c11 -Iggml/include -Iggml/src ggml/src/ggml-nf4dq.c
+```
 
 Add `ggml-nf4dq.c` to the source list in `ggml/src/CMakeLists.txt` alongside
 `ggml-quants.c`.

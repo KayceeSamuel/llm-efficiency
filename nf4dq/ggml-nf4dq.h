@@ -100,6 +100,12 @@
 #include <stdint.h>
 #include <stddef.h>
 
+// GGML_COMMON_DECL_C must be defined before ggml-common.h or ggml_half and
+// the block typedefs are compiled out. ggml-quants.h does the same.
+#define GGML_COMMON_DECL_C
+#include "ggml-common.h"
+#include "ggml.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -108,12 +114,10 @@ extern "C" {
 #define NF4DQ_SUB      32   // weights per sub-block (measured, see above)
 #define NF4DQ_NSUB    (QK_NF4DQ / NF4DQ_SUB)
 
-typedef uint16_t nf4dq_half;   // stand-in for ggml_half in standalone builds
-
 typedef struct {
     uint8_t     qs[QK_NF4DQ / 2];     // 512 bytes: packed 4-bit weight indices
     uint8_t     sc[NF4DQ_NSUB / 2];   //  16 bytes: packed 4-bit scale indices
-    nf4dq_half  d;                    //   2 bytes: super-scale
+    ggml_half   d;                    //   2 bytes: super-scale
     uint8_t     pad[2];               //   2 bytes: 4-byte alignment, see above
 } block_nf4dq;                        // 532 bytes total
 
@@ -141,6 +145,10 @@ extern const int8_t NF4DQ_I8[16];
 // sub-block absmax. Fitted by Lloyd-Max to measured ratios; the top level is
 // pinned to 1.0 because one sub-block per superblock attains it by definition.
 extern const float NF4DQ_SCALE_LEVELS[16];
+
+// NOTE: block_nf4dq is declared here for the standalone build. When wiring
+// into ggml proper, move the struct and the QK_ defines into ggml-common.h
+// alongside the other block types, and reduce this header to declarations.
 
 // Reference (non-SIMD) quantise and dequantise.
 //   k must be a multiple of QK_NF4DQ.

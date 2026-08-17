@@ -77,47 +77,14 @@ static inline uint8_t nf4dq_nearest_scale(float r) {
 }
 
 // ---------------------------------------------------------------- fp16
-// Self-contained fp16 conversion so this file can be tested without pulling
-// in ggml. Replace with ggml_fp32_to_fp16 / ggml_fp16_to_fp32 when wiring in.
+// ggml's conversion, not a local copy. The standalone build carries its own
+// so it can compile without ggml; inside the tree these are better tested and
+// may be hardware-accelerated.
 
-static nf4dq_half fp32_to_fp16(float f) {
-    uint32_t x; memcpy(&x, &f, sizeof(x));
-    uint32_t sign = (x >> 16) & 0x8000u;
-    int32_t  exp  = (int32_t)((x >> 23) & 0xFFu) - 127 + 15;
-    uint32_t man  = x & 0x7FFFFFu;
+#include "ggml-impl.h"
 
-    if (exp <= 0) return (nf4dq_half)sign;              // underflow to zero
-    if (exp >= 31) return (nf4dq_half)(sign | 0x7C00u); // overflow to inf
-
-    // round to nearest even
-    uint32_t h = sign | ((uint32_t)exp << 10) | (man >> 13);
-    if ((man & 0x1FFFu) > 0x1000u ||
-        (((man & 0x1FFFu) == 0x1000u) && (h & 1u))) h++;
-    return (nf4dq_half)h;
-}
-
-static float fp16_to_fp32(nf4dq_half h) {
-    uint32_t sign = (uint32_t)(h & 0x8000u) << 16;
-    uint32_t exp  = (h >> 10) & 0x1Fu;
-    uint32_t man  = h & 0x3FFu;
-    uint32_t x;
-
-    if (exp == 0) {
-        if (man == 0) { x = sign; }
-        else {                                   // subnormal
-            exp = 127 - 15 + 1;
-            while (!(man & 0x400u)) { man <<= 1; exp--; }
-            man &= 0x3FFu;
-            x = sign | (exp << 23) | (man << 13);
-        }
-    } else if (exp == 31) {
-        x = sign | 0x7F800000u | (man << 13);
-    } else {
-        x = sign | ((exp - 15 + 127) << 23) | (man << 13);
-    }
-    float f; memcpy(&f, &x, sizeof(f));
-    return f;
-}
+#define fp32_to_fp16(x) GGML_FP32_TO_FP16(x)
+#define fp16_to_fp32(x) GGML_FP16_TO_FP32(x)
 
 // ---------------------------------------------------------------- quantise
 
