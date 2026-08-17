@@ -123,8 +123,34 @@ index 93ea7eeff..ee0a9c4b1 100644
  void ggml_vec_dot_iq4_nl_q8_0 (int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
  void ggml_vec_dot_iq4_xs_q8_K (int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
  void ggml_vec_dot_iq3_s_q8_K  (int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index d27d8acb1..84f386c5f 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -21,6 +21,7 @@
+ #endif
+ #endif
+ #include "ggml-common.h"
++#include "../ggml-nf4dq.h"
+ 
+ #include <array>
+ #include <algorithm>
+@@ -1111,6 +1112,13 @@ struct ggml_cuda_type_traits<GGML_TYPE_IQ1_M> {
+     static constexpr int qi = QI1_M;
+ };
+ 
++template<>
++struct ggml_cuda_type_traits<GGML_TYPE_NF4DQ> {
++    static constexpr int qk = QK_NF4DQ;   // 1024 weights per superblock
++    static constexpr int qr = 2;          // 2 weights per byte (4-bit)
++    static constexpr int qi = 128;        // 1024/(4*2) = 128 ints, = qs[512]
++};
++
+ template<>
+ struct ggml_cuda_type_traits<GGML_TYPE_IQ4_NL> {
+     static constexpr int qk = QK4_NL;
 diff --git a/ggml/src/ggml-cuda/convert.cu b/ggml/src/ggml-cuda/convert.cu
-index 360c614a4..b77da1968 100644
+index 360c614a4..a610fac09 100644
 --- a/ggml/src/ggml-cuda/convert.cu
 +++ b/ggml/src/ggml-cuda/convert.cu
 @@ -1,4 +1,5 @@
@@ -143,10 +169,10 @@ index 360c614a4..b77da1968 100644
 +// The codebooks live in __constant__ memory. A global-memory lookup per
 +// weight would dominate the kernel: there are two lookups per weight here,
 +// one for the level and one for the sub-block scale.
-+__constant__ static const int8_t knf4dq_i8[16] = {
++static const __device__ int8_t knf4dq_i8[16] = {
 +    -127, -88, -67, -50, -36, -23, -12, 0, 10, 20, 31, 43, 56, 71, 92, 127,
 +};
-+__constant__ static const float knf4dq_scale[16] = {
++static const __device__ float knf4dq_scale[16] = {
 +    0.1126f, 0.1387f, 0.1647f, 0.1973f, 0.2485f, 0.3740f, 0.4436f, 0.4997f,
 +    0.5505f, 0.5998f, 0.6500f, 0.7036f, 0.7624f, 0.8286f, 0.9051f, 1.0000f,
 +};
@@ -171,10 +197,10 @@ index 360c614a4..b77da1968 100644
 +
 +#pragma unroll
 +    for (int j = 0; j < NF4DQ_SUB; ++j) {
-+        const int     pos  = s * NF4DQ_SUB + j;
-+        const uint8_t byte = x->qs[pos >> 1];
-+        const uint8_t idx  = (pos & 1) ? (byte >> 4) : (byte & 0x0F);
-+        y[pos] = (dst_t) ((float) knf4dq_i8[idx] * scale);
++        // ggml packing: byte k holds element k (low) and k+16 (high)
++        const uint8_t byte = x->qs[s * (NF4DQ_SUB / 2) + (j & 15)];
++        const uint8_t idx  = (j < 16) ? (byte & 0x0F) : (byte >> 4);
++        y[s * NF4DQ_SUB + j] = (dst_t) ((float) knf4dq_i8[idx] * scale);
 +    }
 +}
 +
@@ -226,24 +252,10 @@ index 360c614a4..b77da1968 100644
              return dequantize_row_iq4_nl_cuda;
          case GGML_TYPE_IQ4_XS:
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 598f3228c..723a8a364 100644
+index 598f3228c..8d35fa015 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -1789,6 +1789,13 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
-                                    ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) &&
-                                    src0->view_src;
- 
-+    // NF4DQ has no fused vec_dot yet. This gate is separate from
-+    // ggml_cuda_should_use_mmvq and does not consult it, so it needs its own
-+    // exclusion or decode aborts in the mmvq dispatch switch.
-+    if (src0->type == GGML_TYPE_NF4DQ) {
-+        return false;
-+    }
-+
-     bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && !bad_padding_clear && src1->type == GGML_TYPE_F32 &&
-                              dst->type == GGML_TYPE_F32 && src1->ne[1] <= MMVQ_MAX_BATCH_SIZE;
- 
-@@ -4958,6 +4965,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -4958,6 +4958,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                      case GGML_TYPE_IQ2_XXS:
                      case GGML_TYPE_IQ3_S:
                      case GGML_TYPE_IQ3_XXS:
@@ -251,7 +263,7 @@ index 598f3228c..723a8a364 100644
                      case GGML_TYPE_IQ4_NL:
                      case GGML_TYPE_IQ4_XS:
                      case GGML_TYPE_BF16:
-@@ -4996,6 +5004,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -4996,6 +4997,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                      case GGML_TYPE_IQ1_M:
                      case GGML_TYPE_IQ4_XS:
                          return true;
@@ -260,22 +272,146 @@ index 598f3228c..723a8a364 100644
                      case GGML_TYPE_MXFP4:
                          // 32-value sub-blocks, the row size does not guarantee
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index 0589e65bd..9e4b3fbb2 100644
+index 0589e65bd..f4b484410 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
-@@ -283,6 +283,12 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
-     if (!ggml_is_quantized(type)) {
-         return false;
-     }
-+    // NF4DQ has no fused vec_dot yet, so route it through
-+    // dequantise-then-cuBLAS instead of aborting in the dispatch switch.
-+    // Remove this once vec_dot_nf4dq_q8_1 is wired into vecdotq.cuh.
-+    if (type == GGML_TYPE_NF4DQ) {
-+        return false;
+@@ -29,6 +29,7 @@ static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type)
+         case GGML_TYPE_IQ3_XXS: return vec_dot_iq3_xxs_q8_1;
+         case GGML_TYPE_IQ1_S:   return vec_dot_iq1_s_q8_1;
+         case GGML_TYPE_IQ1_M:   return vec_dot_iq1_m_q8_1;
++        case GGML_TYPE_NF4DQ:   return vec_dot_nf4dq_q8_1;
+         case GGML_TYPE_IQ4_NL:  return vec_dot_iq4_nl_q8_1;
+         case GGML_TYPE_IQ4_XS:  return vec_dot_iq4_xs_q8_1;
+         case GGML_TYPE_IQ3_S:   return vec_dot_iq3_s_q8_1;
+@@ -57,6 +58,7 @@ static constexpr __host__ __device__ int get_vdr_mmvq(ggml_type type) {
+         case GGML_TYPE_IQ2_S:   return VDR_IQ2_S_Q8_1_MMVQ;
+         case GGML_TYPE_IQ3_XXS: return VDR_IQ3_XXS_Q8_1_MMVQ;
+         case GGML_TYPE_IQ3_S:   return VDR_IQ3_S_Q8_1_MMVQ;
++        case GGML_TYPE_NF4DQ:   return VDR_NF4DQ_Q8_1_MMVQ;
+         case GGML_TYPE_IQ4_NL:  return VDR_IQ4_NL_Q8_1_MMVQ;
+         case GGML_TYPE_IQ4_XS:  return VDR_IQ4_XS_Q8_1_MMVQ;
+         default:                return 1;
+@@ -120,6 +122,7 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_pascal_older(gg
+         case GGML_TYPE_IQ2_XXS: return 5;
+         case GGML_TYPE_IQ3_S:   return 4;
+         case GGML_TYPE_IQ3_XXS: return 4;
++        case GGML_TYPE_NF4DQ:  return 6;
+         case GGML_TYPE_IQ4_NL:  return 6;
+         case GGML_TYPE_IQ4_XS:  return 5;
+         case GGML_TYPE_MXFP4:   return 4;
+@@ -160,6 +163,7 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_gcn(ggml_type t
+         case GGML_TYPE_IQ2_XXS: return 4;
+         case GGML_TYPE_IQ3_S:   return 4;
+         case GGML_TYPE_IQ3_XXS: return 4;
++        case GGML_TYPE_NF4DQ:  return 6;
+         case GGML_TYPE_IQ4_NL:  return 6;
+         case GGML_TYPE_IQ4_XS:  return 4;
+         case GGML_TYPE_Q2_K:    return 4;
+@@ -210,6 +214,7 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna3(ggml_type
+         case GGML_TYPE_IQ2_XXS: return 4;
+         case GGML_TYPE_IQ3_S:   return 4;
+         case GGML_TYPE_IQ3_XXS: return 4;
++        case GGML_TYPE_NF4DQ:  return 6;
+         case GGML_TYPE_IQ4_NL:  return 6;
+         case GGML_TYPE_IQ4_XS:  return 6;
+         case GGML_TYPE_Q4_K:    return 4;
+@@ -228,6 +233,7 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna4(ggml_type
+         case GGML_TYPE_IQ2_XXS: return 4;
+         case GGML_TYPE_IQ3_S:   return 4;
+         case GGML_TYPE_IQ3_XXS: return 4;
++        case GGML_TYPE_NF4DQ:  return 7;
+         case GGML_TYPE_IQ4_NL:  return 7;
+         case GGML_TYPE_IQ4_XS:  return 5;
+         case GGML_TYPE_MXFP4:   return 5;
+@@ -397,6 +403,7 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
+                 case GGML_TYPE_Q4_K:
+                 case GGML_TYPE_Q5_K:
+                 case GGML_TYPE_Q6_K:
++                case GGML_TYPE_NF4DQ:
+                 case GGML_TYPE_IQ4_NL:
+                 case GGML_TYPE_IQ4_XS:
+                     return 8;
+@@ -1126,6 +1133,12 @@ static void mul_mat_vec_q_switch_type(
+                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+                  nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
+             break;
++        case GGML_TYPE_NF4DQ:
++            mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_NF4DQ>
++                (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
++                 nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
++                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
++            break;
+         case GGML_TYPE_IQ4_NL:
+             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_IQ4_NL>
+                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
+diff --git a/ggml/src/ggml-cuda/vecdotq.cuh b/ggml/src/ggml-cuda/vecdotq.cuh
+index 0f039c735..5594d89c4 100644
+--- a/ggml/src/ggml-cuda/vecdotq.cuh
++++ b/ggml/src/ggml-cuda/vecdotq.cuh
+@@ -1,6 +1,7 @@
+ #pragma once
+ 
+ #include "common.cuh"
++#include "../ggml-nf4dq.h"
+ 
+ #include <cstdint>
+ 
+@@ -1310,6 +1311,55 @@ static __device__ __forceinline__ float vec_dot_iq1_m_q8_1(
+     return d * ((sumi[0] + sumf[0]) * sc0 + (sumi[1] + sumf[1]) * sc1);
+ }
+ 
++
++// NF4DQ: 1024-weight superblock, 32 sub-blocks of 32 weights.
++//
++// Two constant tables. The weight codebook is int8 so the inner loop can use
++// dp4a, one instruction per four multiply-accumulates. The scale codebook
++// stays float because it is consulted once per 32 weights, not per weight.
++static const __device__ int8_t kvalues_nf4dq[16] = {
++    -127, -88, -67, -50, -36, -23, -12, 0, 10, 20, 31, 43, 56, 71, 92, 127,
++};
++static const __device__ float kscales_nf4dq[16] = {
++    0.1126f, 0.1387f, 0.1647f, 0.1973f, 0.2485f, 0.3740f, 0.4436f, 0.4997f,
++    0.5505f, 0.5998f, 0.6500f, 0.7036f, 0.7624f, 0.8286f, 0.9051f, 1.0000f,
++};
++
++#define VDR_NF4DQ_Q8_1_MMVQ 4
++#define VDR_NF4DQ_Q8_1_MMQ  4
++
++static __device__ __forceinline__ float vec_dot_nf4dq_q8_1(
++    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1,
++    const int & kbx, const int & iqs) {
++
++    const block_nf4dq * bq = (const block_nf4dq *) vbq + kbx;
++
++    // iqs advances 4 ints (32 nibbles, 32 weights) per sub-block, so iqs/4 is
++    // both the sub-block index and the q8_1 block index.
++    const int s = iqs / 4;
++
++    int sumi = 0;
++#pragma unroll
++    for (int j = 0; j < 4; ++j) {
++        const int  aux_q4 = get_int_b4(bq->qs, iqs + j);
++        const int2 v      = get_int_from_table_16(aux_q4, kvalues_nf4dq);
++
++        const int u0 = get_int_b4(bq8_1[s].qs, j + 0);
++        const int u1 = get_int_b4(bq8_1[s].qs, j + 4);
++
++        sumi = ggml_cuda_dp4a(v.x, u0, sumi);
++        sumi = ggml_cuda_dp4a(v.y, u1, sumi);
 +    }
-     if (GGML_CUDA_CC_IS_CDNA(cc)) {
-         if (GGML_CUDA_CC_IS_CDNA1(cc)) {
-             switch (type) {
++
++    const uint8_t sbyte = bq->sc[s >> 1];
++    const uint8_t si    = (s & 1) ? (sbyte >> 4) : (sbyte & 0x0F);
++
++    // bq->d already carries the /127 from the int8 codebook, folded in by the
++    // encoder, so there is no division here.
++    const float d = __half2float(bq->d) * __low2float(bq8_1[s].ds);
++    return d * kscales_nf4dq[si] * sumi;
++}
++
+ #define VDR_IQ4_NL_Q8_1_MMVQ 2
+ #define VDR_IQ4_NL_Q8_1_MMQ  4
+ 
 diff --git a/ggml/src/ggml-quants.c b/ggml/src/ggml-quants.c
 index 1ebc50a76..f116a1fe3 100644
 --- a/ggml/src/ggml-quants.c
