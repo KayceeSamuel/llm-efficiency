@@ -123,6 +123,159 @@ index 93ea7eeff..ee0a9c4b1 100644
  void ggml_vec_dot_iq4_nl_q8_0 (int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
  void ggml_vec_dot_iq4_xs_q8_K (int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
  void ggml_vec_dot_iq3_s_q8_K  (int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
+diff --git a/ggml/src/ggml-cuda/convert.cu b/ggml/src/ggml-cuda/convert.cu
+index 360c614a4..b77da1968 100644
+--- a/ggml/src/ggml-cuda/convert.cu
++++ b/ggml/src/ggml-cuda/convert.cu
+@@ -1,4 +1,5 @@
+ #include "convert.cuh"
++#include "../ggml-nf4dq.h"
+ #include "dequantize.cuh"
+ 
+ #include <cstdint>
+@@ -222,6 +223,47 @@ static __global__ void dequantize_block_iq1_m(const void * __restrict__ vx, dst_
+     dequantize_iq1_m(vx, i, yy + i*QK_K, threadIdx.x);
+ }
+ 
++// NF4DQ: 1024-weight superblock, 32 sub-blocks of 32, 4-bit weight indices
++// into an int8 codebook and 4-bit scale indices into a float codebook.
++//
++// The codebooks live in __constant__ memory. A global-memory lookup per
++// weight would dominate the kernel: there are two lookups per weight here,
++// one for the level and one for the sub-block scale.
++__constant__ static const int8_t knf4dq_i8[16] = {
++    -127, -88, -67, -50, -36, -23, -12, 0, 10, 20, 31, 43, 56, 71, 92, 127,
++};
++__constant__ static const float knf4dq_scale[16] = {
++    0.1126f, 0.1387f, 0.1647f, 0.1973f, 0.2485f, 0.3740f, 0.4436f, 0.4997f,
++    0.5505f, 0.5998f, 0.6500f, 0.7036f, 0.7624f, 0.8286f, 0.9051f, 1.0000f,
++};
++
++template<typename dst_t>
++static __global__ void dequantize_block_nf4dq(const void * __restrict__ vx,
++                                              dst_t * __restrict__ yy) {
++    const int64_t i = blockIdx.x;                    // superblock
++    const block_nf4dq * x = (const block_nf4dq *) vx + i;
++    dst_t * y = yy + i * QK_NF4DQ;
++
++    // d already carries the /127 folded in by the encoder, so there is no
++    // division on this path. See ggml-nf4dq.c.
++    const float d = __half2float(x->d);
++
++    const int s = threadIdx.x;                       // one sub-block per thread
++    if (s >= NF4DQ_NSUB) return;
++
++    const uint8_t sbyte = x->sc[s >> 1];
++    const uint8_t si    = (s & 1) ? (sbyte >> 4) : (sbyte & 0x0F);
++    const float   scale = d * knf4dq_scale[si];
++
++#pragma unroll
++    for (int j = 0; j < NF4DQ_SUB; ++j) {
++        const int     pos  = s * NF4DQ_SUB + j;
++        const uint8_t byte = x->qs[pos >> 1];
++        const uint8_t idx  = (pos & 1) ? (byte >> 4) : (byte & 0x0F);
++        y[pos] = (dst_t) ((float) knf4dq_i8[idx] * scale);
++    }
++}
++
+ template<typename dst_t>
+ static __global__ void dequantize_block_iq4_nl(const void * __restrict__ vx, dst_t * __restrict__ yy) {
+     const int64_t i = blockIdx.x;
+@@ -350,6 +392,16 @@ static void dequantize_row_iq1_s_cuda(const void * vx, dst_t * y, const int64_t
+     dequantize_block_iq1_s<<<nb, 32, 0, stream>>>(vx, y);
+ }
+ 
++
++template<typename dst_t>
++static void dequantize_row_nf4dq_cuda(const void * vx, dst_t * y,
++                                      const int64_t k, cudaStream_t stream) {
++    const int nb = (k + QK_NF4DQ - 1) / QK_NF4DQ;
++    // 32 threads, one per sub-block. Not 32 because that is ggml's habit:
++    // NF4DQ_NSUB happens to be 32 as well, so the two coincide.
++    dequantize_block_nf4dq<<<nb, NF4DQ_NSUB, 0, stream>>>(vx, y);
++}
++
+ template<typename dst_t>
+ static void dequantize_row_iq4_nl_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
+     const int nb = (k + QK_K - 1) / QK_K;
+@@ -493,6 +545,8 @@ to_bf16_cuda_t ggml_get_to_bf16_cuda(ggml_type type) {
+             return dequantize_row_iq1_s_cuda;
+         case GGML_TYPE_IQ1_M:
+             return dequantize_row_iq1_m_cuda;
++        case GGML_TYPE_NF4DQ:
++            return dequantize_row_nf4dq_cuda;
+         case GGML_TYPE_IQ4_NL:
+             return dequantize_row_iq4_nl_cuda;
+         case GGML_TYPE_IQ4_XS:
+@@ -553,6 +607,8 @@ to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
+             return dequantize_row_iq1_s_cuda;
+         case GGML_TYPE_IQ1_M:
+             return dequantize_row_iq1_m_cuda;
++        case GGML_TYPE_NF4DQ:
++            return dequantize_row_nf4dq_cuda;
+         case GGML_TYPE_IQ4_NL:
+             return dequantize_row_iq4_nl_cuda;
+         case GGML_TYPE_IQ4_XS:
+@@ -610,6 +666,8 @@ to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type) {
+             return dequantize_row_iq1_s_cuda;
+         case GGML_TYPE_IQ1_M:
+             return dequantize_row_iq1_m_cuda;
++        case GGML_TYPE_NF4DQ:
++            return dequantize_row_nf4dq_cuda;
+         case GGML_TYPE_IQ4_NL:
+             return dequantize_row_iq4_nl_cuda;
+         case GGML_TYPE_IQ4_XS:
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 598f3228c..723a8a364 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -1789,6 +1789,13 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
+                                    ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) &&
+                                    src0->view_src;
+ 
++    // NF4DQ has no fused vec_dot yet. This gate is separate from
++    // ggml_cuda_should_use_mmvq and does not consult it, so it needs its own
++    // exclusion or decode aborts in the mmvq dispatch switch.
++    if (src0->type == GGML_TYPE_NF4DQ) {
++        return false;
++    }
++
+     bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && !bad_padding_clear && src1->type == GGML_TYPE_F32 &&
+                              dst->type == GGML_TYPE_F32 && src1->ne[1] <= MMVQ_MAX_BATCH_SIZE;
+ 
+@@ -4958,6 +4965,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+                     case GGML_TYPE_IQ2_XXS:
+                     case GGML_TYPE_IQ3_S:
+                     case GGML_TYPE_IQ3_XXS:
++                    case GGML_TYPE_NF4DQ:
+                     case GGML_TYPE_IQ4_NL:
+                     case GGML_TYPE_IQ4_XS:
+                     case GGML_TYPE_BF16:
+@@ -4996,6 +5004,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+                     case GGML_TYPE_IQ1_M:
+                     case GGML_TYPE_IQ4_XS:
+                         return true;
++                    case GGML_TYPE_NF4DQ:
+                     case GGML_TYPE_IQ4_NL:
+                     case GGML_TYPE_MXFP4:
+                         // 32-value sub-blocks, the row size does not guarantee
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index 0589e65bd..9e4b3fbb2 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -283,6 +283,12 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
+     if (!ggml_is_quantized(type)) {
+         return false;
+     }
++    // NF4DQ has no fused vec_dot yet, so route it through
++    // dequantise-then-cuBLAS instead of aborting in the dispatch switch.
++    // Remove this once vec_dot_nf4dq_q8_1 is wired into vecdotq.cuh.
++    if (type == GGML_TYPE_NF4DQ) {
++        return false;
++    }
+     if (GGML_CUDA_CC_IS_CDNA(cc)) {
+         if (GGML_CUDA_CC_IS_CDNA1(cc)) {
+             switch (type) {
 diff --git a/ggml/src/ggml-quants.c b/ggml/src/ggml-quants.c
 index 1ebc50a76..f116a1fe3 100644
 --- a/ggml/src/ggml-quants.c
