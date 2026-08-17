@@ -20,6 +20,23 @@ const float NF4DQ_LEVELS[16] = {
      0.7229568362236023f,  1.0f,
 };
 
+// Sub-block scale levels: absmax_subblock / absmax_superblock. Fitted by
+// Lloyd-Max, top level pinned to 1.0 (one sub-block attains it by definition).
+//
+// Fitted on a MIX of outlier-free and 16-sigma-outlier data. An earlier
+// version fitted on outlier-free data alone spanned only 0.3355 to 1.0 and
+// failed badly when a superblock contained an extreme weight: the other
+// sub-blocks have ratios near 0.06, clamp to the 0.3355 floor, and their
+// weights collapse into the lowest NF4 levels. Measured 0.139 against 0.101
+// for this codebook on outlier data. Experiment 2 measured max/std of 15.4
+// and 16.8 on real weights, so that regime is the normal case, not an edge.
+const float NF4DQ_SCALE_LEVELS[16] = {
+    0.1126f, 0.1387f, 0.1647f, 0.1973f, 0.2485f, 0.3740f, 0.4436f, 0.4997f,
+    0.5505f, 0.5998f, 0.6500f, 0.7036f, 0.7624f, 0.8286f, 0.9051f, 1.0000f,
+};
+
+static float nf4dq_scale_bounds[15];
+
 // Midpoints between adjacent levels. A value is assigned to the level whose
 // cell it falls in, which for a monotonic codebook is nearest-neighbour.
 static float nf4dq_boundaries[15];
@@ -29,6 +46,8 @@ static void nf4dq_init_boundaries(void) {
     if (nf4dq_boundaries_ready) return;
     for (int i = 0; i < 15; i++) {
         nf4dq_boundaries[i] = (NF4DQ_LEVELS[i] + NF4DQ_LEVELS[i + 1]) * 0.5f;
+        nf4dq_scale_bounds[i] =
+            (NF4DQ_SCALE_LEVELS[i] + NF4DQ_SCALE_LEVELS[i + 1]) * 0.5f;
     }
     nf4dq_boundaries_ready = 1;
 }
@@ -39,6 +58,12 @@ static void nf4dq_init_boundaries(void) {
 static inline uint8_t nf4dq_nearest(float v) {
     uint8_t i = 0;
     while (i < 15 && v > nf4dq_boundaries[i]) i++;
+    return i;
+}
+
+static inline uint8_t nf4dq_nearest_scale(float r) {
+    uint8_t i = 0;
+    while (i < 15 && r > nf4dq_scale_bounds[i]) i++;
     return i;
 }
 
@@ -98,7 +123,7 @@ void quantize_row_nf4dq_ref(const float * restrict x, block_nf4dq * restrict y,
         const float * xb = x + i * QK_NF4DQ;
         block_nf4dq * yb = &y[i];
 
-        // Level 1: absmax per 64-weight sub-block.
+        // Level 1: absmax per sub-block, and the superblock's largest.
         float absmax[NF4DQ_NSUB];
         float max_absmax = 0.0f;
 
@@ -112,43 +137,34 @@ void quantize_row_nf4dq_ref(const float * restrict x, block_nf4dq * restrict y,
             if (m > max_absmax) max_absmax = m;
         }
 
-        // Level 2: quantise those absmax values to uint8 against one fp16
-        // super-scale. This is the "double" in double quantisation, and it
-        // is where the format beats a plain fp16-scale layout on size.
-        //
-        // absmax is non-negative by construction, so an unsigned 0..255 grid
-        // with no zero point is the right shape. No offset term is used; the
-        // 27B measurement it is validated against does not use one either.
-        float d = (max_absmax > 0.0f) ? (max_absmax / 255.0f) : 0.0f;
-        yb->d = fp32_to_fp16(d);
+        yb->d = fp32_to_fp16(max_absmax);
 
         // Read the super-scale back through fp16 before using it. The decoder
         // only ever sees the rounded value, so the encoder must quantise
         // against the same number or the two disagree by the rounding error.
         const float d_eff = fp16_to_fp32(yb->d);
 
-        for (int s = 0; s < NF4DQ_NSUB; s++) {
-            int q = (d_eff > 0.0f) ? (int)lrintf(absmax[s] / d_eff) : 0;
-            if (q < 0)   q = 0;
-            if (q > 255) q = 255;
-            yb->sc[s] = (uint8_t)q;
-        }
-
-        // Weights, against the reconstructed sub-block scale, for the same
-        // reason: quantise against what the decoder will actually use.
+        // Level 2: each sub-block absmax as a fraction of the superblock's,
+        // mapped to a 16-entry codebook and packed two indices per byte.
+        memset(yb->sc, 0, sizeof(yb->sc));
         memset(yb->qs, 0, sizeof(yb->qs));
 
         for (int s = 0; s < NF4DQ_NSUB; s++) {
-            const float scale = d_eff * (float)yb->sc[s];
+            const float ratio = (d_eff > 0.0f) ? (absmax[s] / d_eff) : 0.0f;
+            const uint8_t si = nf4dq_nearest_scale(ratio);
+            if ((s & 1) == 0) yb->sc[s >> 1] |= si;
+            else              yb->sc[s >> 1] |= (uint8_t)(si << 4);
+
+            // Weights, against the reconstructed sub-block scale, for the
+            // same reason: quantise against what the decoder will use.
+            const float scale = d_eff * NF4DQ_SCALE_LEVELS[si];
             const float inv   = (scale > 0.0f) ? (1.0f / scale) : 0.0f;
 
             for (int j = 0; j < NF4DQ_SUB; j++) {
-                const int      pos = s * NF4DQ_SUB + j;
-                const float    v   = (inv > 0.0f) ? xb[pos] * inv : 0.0f;
-                const uint8_t  idx = nf4dq_nearest(v);
+                const int     pos = s * NF4DQ_SUB + j;
+                const float   v   = (inv > 0.0f) ? xb[pos] * inv : 0.0f;
+                const uint8_t idx = nf4dq_nearest(v);
 
-                // Low nibble for even positions, high for odd. Identical to
-                // the packing in harness/qembed.py.
                 if ((pos & 1) == 0) yb->qs[pos >> 1] |= idx;
                 else                yb->qs[pos >> 1] |= (uint8_t)(idx << 4);
             }
@@ -167,9 +183,10 @@ void dequantize_row_nf4dq(const block_nf4dq * restrict x, float * restrict y,
         const block_nf4dq * xb = &x[i];
         float * yb = y + i * QK_NF4DQ;
         const float d = fp16_to_fp32(xb->d);
-
         for (int s = 0; s < NF4DQ_NSUB; s++) {
-            const float scale = d * (float)xb->sc[s];
+            const uint8_t sbyte = xb->sc[s >> 1];
+            const uint8_t si    = ((s & 1) == 0) ? (sbyte & 0x0F) : (sbyte >> 4);
+            const float scale   = d * NF4DQ_SCALE_LEVELS[si];
 
             for (int j = 0; j < NF4DQ_SUB; j++) {
                 const int pos = s * NF4DQ_SUB + j;
@@ -202,4 +219,21 @@ float nf4dq_roundtrip_error(const float * x, int64_t k) {
 
     free(q); free(r);
     return (den > 0.0) ? (float)sqrt(num / den) : 0.0f;
+}
+
+// ---------------------------------------------------------- row wrapper
+// The entry point ggml_quantize_chunk calls. Kept here rather than in the
+// integration patch so the standalone build exercises the same code path.
+
+size_t quantize_nf4dq(const float * restrict src, void * restrict dst,
+                      int64_t nrow, int64_t n_per_row) {
+    if (n_per_row % QK_NF4DQ) return 0;   // caller must check; 0 means refused
+    const size_t row_size = (size_t)(n_per_row / QK_NF4DQ) * sizeof(block_nf4dq);
+    char * qrow = (char *) dst;
+    for (int64_t row = 0; row < nrow; ++row) {
+        quantize_row_nf4dq_ref(src, (block_nf4dq *) qrow, n_per_row);
+        src  += n_per_row;
+        qrow += row_size;
+    }
+    return (size_t) nrow * row_size;
 }
