@@ -26,9 +26,31 @@
 //            by either implementation is readable by the other.
 //   sc[16]   4-bit indices into NF4DQ_SCALE_LEVELS, two per byte, one per
 //            32-weight sub-block. Sub-block absmax = d * SCALE_LEVELS[sc[i]].
-//   d        fp16 super-scale: the largest sub-block absmax in the superblock.
+//   d        fp16 super-scale: the largest sub-block absmax in the superblock,
+//            pre-divided by 127 so the int8 codebook needs no runtime division.
+//   pad      2 bytes, so the struct is 4-byte aligned. See below.
 //
-//   530 bytes / 1024 weights = 4.1406 bpw.
+//   532 bytes / 1024 weights = 4.1562 bpw.
+//
+// WHY THE PADDING, MEASURED
+//
+// Without it the struct is 530 bytes with alignment 2, so consecutive blocks
+// alternate between 4-byte aligned and 2 bytes off:
+//
+//     block 0: qs offset % 4 = 0
+//     block 1: qs offset % 4 = 2   <-- misaligned
+//     block 2: qs offset % 4 = 0
+//     ...
+//
+// ggml's CUDA vec_dot helpers read the packed nibbles four bytes at a time
+// through get_int_b4, which assumes 4-byte alignment. On misaligned blocks
+// that either faults or silently reads across the boundary, and a silent
+// wrong answer is far worse than a crash in a quantisation format.
+//
+// Every shipped ggml block type is a multiple of 4: block_iq4_xs is 136,
+// block_q4_K is 144. That is presumably why this has not come up upstream.
+//
+// Cost of the fix: 0.0156 bpw, which is about 0.05 GB on a 27B model.
 //
 // WHY SUB = 32 WITH 4-BIT SCALES, MEASURED
 //
@@ -92,17 +114,28 @@ typedef struct {
     uint8_t     qs[QK_NF4DQ / 2];     // 512 bytes: packed 4-bit weight indices
     uint8_t     sc[NF4DQ_NSUB / 2];   //  16 bytes: packed 4-bit scale indices
     nf4dq_half  d;                    //   2 bytes: super-scale
-} block_nf4dq;                        // 530 bytes total
+    uint8_t     pad[2];               //   2 bytes: 4-byte alignment, see above
+} block_nf4dq;                        // 532 bytes total
 
 // Compile-time guarantee that no padding crept in. A silently padded struct
 // would produce a file that is the right size on one compiler and the wrong
 // size on another, which is exactly the class of bug that is invisible until
 // someone else tries to load the checkpoint.
-typedef char nf4dq_size_check[(sizeof(block_nf4dq) == 530) ? 1 : -1];
+typedef char nf4dq_size_check[(sizeof(block_nf4dq) == 532) ? 1 : -1];
+
+// The alignment assert is the one that actually matters: a 532-byte struct
+// that the compiler still aligns to 2 would pass the size check and fail in
+// the CUDA kernel.
+typedef char nf4dq_align_check[(sizeof(block_nf4dq) % 4 == 0) ? 1 : -1];
 
 // The 16 NF4 levels: quantiles of a standard normal, normalised to [-1, 1].
 // Byte-identical to NF4_LEVELS in harness/qembed.py and validate.py.
 extern const float NF4DQ_LEVELS[16];
+
+// The same levels on a 1/127 grid, which is what both the CPU reference and
+// the CUDA dp4a path actually use. NF4DQ_LEVELS is kept for documentation and
+// for fitting work; it is not on the encode or decode path.
+extern const int8_t NF4DQ_I8[16];
 
 // The 16 sub-block scale levels, as fractions of the superblock's largest
 // sub-block absmax. Fitted by Lloyd-Max to measured ratios; the top level is

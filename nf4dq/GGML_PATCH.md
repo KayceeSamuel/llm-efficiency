@@ -68,9 +68,19 @@ load the checkpoint.
 typedef struct {
     uint8_t    qs[QK_NF4DQ / 2];      // 512 B: 4-bit weight indices
     uint8_t    sc[NF4DQ_NSUB / 2];    //  16 B: 4-bit scale indices
-    ggml_half  d;                     //   2 B: super-scale
-} block_nf4dq;                        // 530 B
-static_assert(sizeof(block_nf4dq) == 530, "wrong nf4dq block size/padding");
+    ggml_half  d;                     //   2 B: super-scale (carries /127)
+    uint8_t    pad[2];                //   2 B: 4-byte alignment
+} block_nf4dq;                        // 532 B
+static_assert(sizeof(block_nf4dq) == 532, "wrong nf4dq block size/padding");
+static_assert(sizeof(block_nf4dq) % 4 == 0, "nf4dq block must be 4-byte aligned");
+
+// The padding is not cosmetic. Without it the struct is 530 bytes with
+// alignment 2, so consecutive blocks alternate between aligned and 2 bytes
+// off (verified with nf4dq/align_test.c). get_int_b4 in the CUDA vec_dot
+// reads four bytes at a time and assumes alignment; on the odd blocks that
+// faults or silently reads across the boundary. Every shipped ggml block type
+// is a multiple of 4 (iq4_xs is 136, q4_K is 144), which is presumably why
+// this has not come up upstream. Cost: 0.0156 bpw, about 0.05 GB on a 27B.
 ```
 
 Note `QK_NF4DQ` is 1024, not ggml's usual `QK_K` of 256. That is forced, not
@@ -171,7 +181,7 @@ Append, same reasoning as 1a.
 ### 2c. `tools/quantize/quantize.cpp`, the type table
 
 ```c
-    { "NF4DQ", LLAMA_FTYPE_MOSTLY_NF4DQ, " 4.14 bpw NF4 with double quantisation", },
+    { "NF4DQ", LLAMA_FTYPE_MOSTLY_NF4DQ, " 4.16 bpw NF4 with double quantisation", },
 ```
 
 After this, `--pure NF4DQ` and `--output-tensor-type nf4dq` both resolve.
@@ -247,7 +257,7 @@ Projected from measured components on Qwen3.8-27B:
 |---|---|---|---|
 | Stock Q4_K_M | 15.64 GB | 4.92 | measured |
 | `--pure` Q4_K | 14.32 GB | 4.50 | measured |
-| **`--pure` NF4DQ** | **~13.20 GB** | **4.1406** | projected |
+| **`--pure` NF4DQ** | **~13.25 GB** | **4.1562** | projected |
 | bitsandbytes + qembed | 12.968 GB | ~4.13 | measured |
 
 The GGUF file carries `blk.64.nextn.*`, the multi-token-prediction head, which

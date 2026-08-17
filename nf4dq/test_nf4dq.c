@@ -38,10 +38,12 @@ int main(void){
     printf("all zeros                : %.6f  (expect 0.000000)\n",
            nf4dq_roundtrip_error(x,K));
 
-    // 4. Exact-level reconstruction: values already on the codebook should
-    //    survive a round trip essentially untouched.
-    for (int64_t i=0;i<K;i++) x[i]=NF4DQ_LEVELS[i%16];
-    printf("on-codebook values       : %.6f  (expect ~0)\n",
+    // 4. Exact-level reconstruction. Must use the I8 grid, not NF4DQ_LEVELS:
+    //    since the codebook became int8 for dp4a, the float levels are no
+    //    longer exactly representable and this test would report ~0.004 as a
+    //    failure when it is the intended rounding.
+    for (int64_t i=0;i<K;i++) x[i]=(float)NF4DQ_I8[i%16]/127.0f;
+    printf("on-codebook values (I8)  : %.6f  (expect ~0)\n",
            nf4dq_roundtrip_error(x,K));
 
     free(x);
