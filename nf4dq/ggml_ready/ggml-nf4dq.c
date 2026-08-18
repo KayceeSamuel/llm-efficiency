@@ -148,8 +148,13 @@ void quantize_row_nf4dq_ref(const float * restrict x, block_nf4dq * restrict y,
                 const float   v   = (inv > 0.0f) ? xb[pos] * inv : 0.0f;
                 const uint8_t idx = nf4dq_nearest(v);
 
-                if ((pos & 1) == 0) yb->qs[pos >> 1] |= idx;
-                else                yb->qs[pos >> 1] |= (uint8_t)(idx << 4);
+                // ggml packing: within a 32-element sub-block, byte k holds
+                // element k in the low nibble and element k+16 in the high
+                // nibble. NOT interleaved. get_int_from_table_16 in the CUDA
+                // vec_dot depends on this exact layout.
+                const int byte = s * (NF4DQ_SUB / 2) + (j & 15);
+                if (j < 16) yb->qs[byte] |= idx;
+                else        yb->qs[byte] |= (uint8_t)(idx << 4);
             }
         }
     }
@@ -173,9 +178,8 @@ void dequantize_row_nf4dq(const block_nf4dq * restrict x, float * restrict y,
 
             for (int j = 0; j < NF4DQ_SUB; j++) {
                 const int pos = s * NF4DQ_SUB + j;
-                const uint8_t byte = xb->qs[pos >> 1];
-                const uint8_t idx  = ((pos & 1) == 0) ? (byte & 0x0F)
-                                                      : (byte >> 4);
+                const uint8_t byte = xb->qs[s * (NF4DQ_SUB / 2) + (j & 15)];
+                const uint8_t idx  = (j < 16) ? (byte & 0x0F) : (byte >> 4);
                 // I8 grid, matching vec_dot_nf4dq_q8_1 exactly. d carries
                 // the /127.
                 yb[pos] = (float) NF4DQ_I8[idx] * scale;
@@ -221,4 +225,52 @@ size_t quantize_nf4dq(const float * restrict src, void * restrict dst,
         qrow += row_size;
     }
     return (size_t) nrow * row_size;
+}
+
+
+// ------------------------------------------------------- CPU vec_dot
+// Dot product of one NF4DQ row against a Q8_0-quantised activation row.
+//
+// Q8_0 blocks are 32 elements and an NF4DQ sub-block is also 32 weights, so
+// they align one to one: sub-block s pairs with q8 block s. Same alignment
+// IQ4_NL relies on, which is why Q8_0 is the right vec_dot_type here.
+//
+// Scalar and unvectorised. This exists so CPU inference runs as a correctness
+// gate; the performance path is vec_dot_nf4dq_q8_1 in CUDA.
+
+#include "ggml-common.h"
+
+void ggml_vec_dot_nf4dq_q8_0(int n, float * restrict s, size_t bs,
+                             const void * restrict vx, size_t bx,
+                             const void * restrict vy, size_t by, int nrc) {
+    (void) bs; (void) bx; (void) by; (void) nrc;
+
+    const block_nf4dq * restrict x = (const block_nf4dq *) vx;
+    const block_q8_0  * restrict y = (const block_q8_0  *) vy;
+
+    const int nb = n / QK_NF4DQ;
+    float sumf = 0.0f;
+
+    for (int i = 0; i < nb; i++) {
+        const float d = fp16_to_fp32(x[i].d);   // already carries the /127
+
+        for (int s_ = 0; s_ < NF4DQ_NSUB; s_++) {
+            const uint8_t sbyte = x[i].sc[s_ >> 1];
+            const uint8_t si    = (s_ & 1) ? (sbyte >> 4) : (sbyte & 0x0F);
+
+            // one q8_0 block per sub-block
+            const block_q8_0 * yb = &y[i * NF4DQ_NSUB + s_];
+
+            int sumi = 0;
+            for (int j = 0; j < NF4DQ_SUB; j++) {
+                const uint8_t byte = x[i].qs[s_ * (NF4DQ_SUB / 2) + (j & 15)];
+                const uint8_t idx  = (j < 16) ? (byte & 0x0F) : (byte >> 4);
+                sumi += (int) NF4DQ_I8[idx] * (int) yb->qs[j];
+            }
+
+            sumf += d * NF4DQ_SCALE_LEVELS[si] * fp16_to_fp32(yb->d) * sumi;
+        }
+    }
+
+    *s = sumf;
 }

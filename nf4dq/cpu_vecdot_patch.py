@@ -100,7 +100,9 @@ if "GGML_TYPE_NF4DQ" not in s:
 p = f"{P}/ggml/src/ggml-cpu/ops.cpp"
 s = open(p).read()
 before = s.count("case GGML_TYPE_NF4DQ:")
-s = s.replace("        case GGML_TYPE_IQ4_NL:\n        case GGML_TYPE_IQ4_XS:",
+if before:
+    print(f"ops.cpp: already has {before} cases, skipping")
+s = s if before else s.replace("        case GGML_TYPE_IQ4_NL:\n        case GGML_TYPE_IQ4_XS:",
               "        case GGML_TYPE_NF4DQ:\n        case GGML_TYPE_IQ4_NL:\n"
               "        case GGML_TYPE_IQ4_XS:")
 open(p, "w").write(s)
