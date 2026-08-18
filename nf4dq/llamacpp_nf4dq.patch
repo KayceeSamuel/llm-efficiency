@@ -252,7 +252,7 @@ index 360c614a4..a610fac09 100644
              return dequantize_row_iq4_nl_cuda;
          case GGML_TYPE_IQ4_XS:
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 598f3228c..8d35fa015 100644
+index f2e381ee0..4548ef694 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -4958,6 +4958,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
